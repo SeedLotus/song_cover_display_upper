@@ -316,7 +316,7 @@ namespace upper.Services
 
                 // 绘制文本
                 var text = new FormattedText(
-                    "TiX",
+                    "T X",
                     System.Globalization.CultureInfo.CurrentCulture,
                     System.Windows.FlowDirection.LeftToRight,
                     new Typeface("Arial"),
@@ -328,6 +328,21 @@ namespace upper.Services
                 // 居中显示
                 double x = (width - text.Width) / 2;
                 double y = (height - text.Height) / 2;
+                drawingContext.DrawText(text, new System.Windows.Point(x, y));
+
+                text = new FormattedText(
+                    "i",
+                    System.Globalization.CultureInfo.CurrentCulture,
+                    System.Windows.FlowDirection.LeftToRight,
+                    new Typeface("Arial"),
+                    Math.Min(width, height) * 0.4,
+                    System.Windows.Media.Brushes.DarkGray,
+                    VisualTreeHelper.GetDpi(drawingVisual).PixelsPerDip
+                );
+
+                // 居中显示
+                x = (width - text.Width) / 2;
+                y = (height - text.Height) / 2;
                 drawingContext.DrawText(text, new System.Windows.Point(x, y));
             }
 

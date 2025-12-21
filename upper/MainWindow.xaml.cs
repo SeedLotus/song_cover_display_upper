@@ -9,7 +9,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Navigation;
-
+using System.Windows.Threading;
 using upper.Services;
 
 namespace upper
@@ -22,7 +22,8 @@ namespace upper
         // ==================== 服务实例声明 ====================
         private readonly MediaService _mediaService; // 系统媒体
         private readonly TrayService _trayService; // 托盘化
-        private AutoStartManager _autoStartManager;
+        private AutoStartManager _autoStartManager; // 开机自启动
+        private readonly SerialPortService _serialPortService; // 串口和下位机控制，ai 没把这两个解耦，就这样吧
 
 
         // ==================== 状态管理字段 ====================
@@ -30,6 +31,8 @@ namespace upper
         private byte[]? _currentImageRgb565Data;      // 当前图片的RGB565编码数据
         private string? _lastImageHash;               // 上次图片哈希（用于变化检测）
         private bool _isExitingFromTrayMenu = false;  // 是否从托盘菜单退出
+        private DispatcherTimer _statusSendTimer;     // 定时发送播放状态到串口
+        private DispatcherTimer _autoReconnectTimer;  // 自动重连定时器
 
 
         public MainWindow()
@@ -40,12 +43,18 @@ namespace upper
             _mediaService = new MediaService();
             _trayService = new TrayService();
             _autoStartManager = new AutoStartManager();
+            _serialPortService = new SerialPortService();
 
 
             // 初始化各模块
             InitializeMediaService();
             InitializeTrayService();
             InitializeAutoStart();
+            InitializeSerialPortService();
+            InitializeTimers();
+
+            // 启动时尝试自动连接设备
+            AutoConnectDevice();
         }
 
     // ==================== 服务初始化 ====================
@@ -144,7 +153,38 @@ namespace upper
                 });
             }
         }
-        // ==================== 事件处理相关 ====================
+
+        /// 初始化串口服务
+        private void InitializeSerialPortService()
+        {
+            // 订阅串口服务事件
+            _serialPortService.ConnectionStateChanged += OnSerialConnectionChanged;
+            _serialPortService.StatusMessage += OnSerialStatusMessage;
+            _serialPortService.DataReceived += OnSerialDataReceived;
+            _serialPortService.ImagePacketSent += OnImagePacketSent;
+        }
+
+        // 初始化定时器
+        private void InitializeTimers()
+        {
+            // 播放状态发送定时器（每秒发送一次）
+            _statusSendTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(1)
+            };
+            _statusSendTimer.Tick += StatusSendTimer_Tick;
+
+            // 自动重连定时器（每5秒尝试一次）
+            _autoReconnectTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(5),
+                IsEnabled = false // 默认不启用，链接失败后启用
+            };
+            _autoReconnectTimer.Tick += AutoReconnectTimer_Tick;
+        }
+
+
+    // ==================== 事件处理相关 ====================
 
         // ==================== 媒体事件处理 ====================
         // 媒体信息变化事件处理
@@ -193,6 +233,9 @@ namespace upper
 
                 //ControlResultText.Text = isPlaying ? "正在播放" : "已暂停";
                 //ControlResultText.Foreground = isPlaying ? System.Windows.Media.Brushes.Green : System.Windows.Media.Brushes.Orange;
+
+                // 发送播放状态给下位机
+                //_serialPortService.SendPlaybackStatus(isPlaying);
             });
         }
 
@@ -278,6 +321,8 @@ namespace upper
                             $"✅ 封面图片就绪 ({_currentImageRgb565Data.Length} 字节, {totalPackets} 包)";
                         //SendImageButton.IsEnabled = _serialPortService.IsConnected;
                     });
+                    // 通知下位机准备接收图片
+                    _serialPortService.SendImageStartCommand();
                 }
             }
             catch (Exception ex)
@@ -309,10 +354,10 @@ namespace upper
         private void HideWindowToTray()
         {
             this.Hide();
-            _trayService.ShowNotification("程序已最小化到托盘",
-                "单击托盘图标可恢复窗口",
-                System.Windows.Forms.ToolTipIcon.Info,
-                1000);
+            //_trayService.ShowNotification("程序已最小化到托盘",
+            //    "单击托盘图标可恢复窗口",
+            //    System.Windows.Forms.ToolTipIcon.Info,
+            //    1000);
         }
 
         private void OpenWebsite()
@@ -359,9 +404,271 @@ namespace upper
         }
 
 
+        // ==================== 串口事件处理 ====================
+
+        // 串口连接状态变化事件处理
+        private void OnSerialConnectionChanged(object sender, bool isConnected)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                // 更新连接状态指示灯
+                StatusLed.Fill = isConnected ? System.Windows.Media.Brushes.LimeGreen : System.Windows.Media.Brushes.Red;
+                ConnectionStatusText.Text = isConnected
+                    ? $"已连接到 {_serialPortService.ConnectedPort}"
+                    : "设备未连接";
+
+                // 更新按钮状态
+                //ConnectButton.Content = isConnected ? "重新连接" : "连接设备";
+                ConnectButton.IsEnabled = !isConnected;
+                DisconnectButton.IsEnabled = isConnected;
+                //SendImageButton.IsEnabled = isConnected && (_currentImageRgb565Data != null);
+
+                // 启动或停止状态发送定时器
+                if (isConnected)
+                {
+                    _statusSendTimer.Start();
+                    _autoReconnectTimer.IsEnabled = false; // 连接成功时关闭自动重连
+                }
+                else
+                {
+                    _statusSendTimer.Stop();
+                }
+            });
+        }
+
+        // 串口状态消息事件处理
+        private void OnSerialStatusMessage(object sender, string message)
+        {
+            Dispatcher.Invoke(() =>
+            {
+            });
+        }
+
+        // 串口数据接收事件处理
+        private void OnSerialDataReceived(object sender, SerialPortService.DataReceivedEventArgs e)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                // 处理控制命令
+                ProcessSerialCommand(e.AsciiString);
+            });
+        }
+
+        // 处理串口接收到的命令
+        private void ProcessSerialCommand(string command)
+        {
+            // 移除可能的空白字符
+            //string trimmedCommand = command.Trim();
+            // 不移除
+            string trimmedCommand = command;
+
+            if (trimmedCommand.StartsWith("/q1"))
+            {
+                // 下位机请求播放命令
+                // 返回系统音频已播放命令
+                _serialPortService.SendPlaybackStatus(true);
+                // 播放系统音频
+                _ = _mediaService.TryPlayAsync();
+            }
+            else if (trimmedCommand.StartsWith("/q0"))
+            {
+                // 下位机请求暂停命令
+                // 返回系统音频已暂停命令
+                _serialPortService.SendPlaybackStatus(false);
+                // 暂停系统音频
+                _ = _mediaService.TryPauseAsync();
+            }
+            else if (trimmedCommand.StartsWith("/r"))
+            {
+                // 重传单个包请求
+                HandleResendSinglePacket(trimmedCommand);
+            }
+            else if (trimmedCommand.StartsWith("/x"))
+            {
+                // 重传后续包请求
+                HandleResendFromPacket(trimmedCommand);
+            }
+            else if (trimmedCommand.StartsWith("/k"))
+            {
+                // 下位机准备接收图片就绪响应
+                // 发送全图
+                _SendImage();
+            }
+            else if (trimmedCommand.StartsWith("/a"))
+            {
+                // 下位机成功接收所有包
+            }
+        }
+
+        // 处理重传单个包请求，todo
+        private void HandleResendSinglePacket(string command)
+        {
+            try
+            {
+                // 解析包序号
+                if (false)
+                {
+                    // 收到重传单个包请求 packetIndex
+
+                    // 执行重传
+                    if (_currentImageRgb565Data != null)
+                    {
+                        //_serialPortService.SendImagePacket(packetIndex, _currentImageRgb565Data);
+                        //_serialPortService.SendImageEndCommand();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // 处理重传请求失败
+            }
+        }
+
+        // 处理重传后续包请求，todo
+        private void HandleResendFromPacket(string command)
+        {
+            try
+            {
+                // 解析起始包序号
+                if (false)
+                {
+                    // 收到重传后续包请求: 从包 startPacketIndex 开始
+
+                    // 执行重传
+                    if (_currentImageRgb565Data != null)
+                    {
+                        int totalPackets = ImageProcessor.CalculatePacketCount(_currentImageRgb565Data);
+
+                        //for (int i = startPacketIndex; i < totalPackets; i++)
+                        //{
+                        //    _serialPortService.SendImagePacket(i, _currentImageRgb565Data);
+                        //}
+
+                        //_serialPortService.SendImageEndCommand();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // 处理重传请求失败
+            }
+        }
 
 
-    // ==================== 控件回调 ====================
+        // 图片包发送事件处理
+        private void OnImagePacketSent(object sender, SerialPortService.ImagePacketEventArgs e)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                if (e.Success)
+                {
+                    ImageTransferStatusText.Text =
+                        $"发送进度: {e.PacketIndex + 1}/{e.TotalPackets} 包 " +
+                        $"(字节 {e.DataStartIndex}-{e.DataStartIndex + e.DataLength})";
+                }
+                else
+                {
+                    ImageTransferStatusText.Text = $"包 {e.PacketIndex} 发送失败: {e.ErrorMessage}";
+                }
+            });
+        }
+
+        // 发送图片服务
+        private async void _SendImage()
+        {
+            if (!_serialPortService.IsConnected)
+            {
+                System.Windows.MessageBox.Show("请先连接设备", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            if (_currentImageRgb565Data == null)
+            {
+                System.Windows.MessageBox.Show("没有可发送的图片数据", "错误", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            try
+            {
+                //SendImageButton.IsEnabled = false;
+                int totalPackets = ImageProcessor.CalculatePacketCount(_currentImageRgb565Data);
+                ImageTransferStatusText.Text = $"开始传输图片，共 {totalPackets} 包...";
+
+                // 1. 发送开始传输命令
+                //_serialPortService.SendImageStartCommand();
+                //await Task.Delay(100); // 等待下位机响应
+
+                // 2. 发送所有数据包
+                for (int i = 0; i < totalPackets; i++)
+                {
+                    _serialPortService.SendImagePacket(i, _currentImageRgb565Data);
+                }
+                await Task.Delay(1); // 微小延迟，避免覆盖
+
+                // 3. 发送结束命令
+                _serialPortService.SendImageEndCommand();
+
+                ImageTransferStatusText.Text = $"✅ 图片发送完成，共 {totalPackets} 包";
+            }
+            catch (Exception ex)
+            {
+                ImageTransferStatusText.Text = $"发送失败: {ex.Message}";
+            }
+            finally
+            {
+                //SendImageButton.IsEnabled = true;
+            }
+        }
+
+        // 自动连接设备
+        private void AutoConnectDevice()
+        {
+            bool success = _serialPortService.AutoConnect();
+
+            if (!success)
+            {
+                // 连接失败，启用自动重连定时器
+                _autoReconnectTimer.IsEnabled = true;
+            }
+        }
+
+        // 播放状态定时发送事件
+        private void StatusSendTimer_Tick(object sender, EventArgs e)
+        {
+            if (!_serialPortService.IsConnected) return;
+
+            // 根据当前播放状态发送相应命令
+            if (_currentPlayStatus == "Playing")
+            {
+                _serialPortService.SendPlaybackStatus(true);
+            }
+            else if (_currentPlayStatus == "Paused")
+            {
+                _serialPortService.SendPlaybackStatus(false);
+            }
+        }
+
+        // 自动重连定时器事件
+        private void AutoReconnectTimer_Tick(object sender, EventArgs e)
+        {
+            if (!_serialPortService.IsConnected)
+            {
+                bool success = _serialPortService.AutoConnect();
+
+                if (success)
+                {
+                    _autoReconnectTimer.IsEnabled = false;
+                }
+            }
+            else
+            {
+                _autoReconnectTimer.IsEnabled = false;
+            }
+        }
+
+
+
+        // ==================== 控件回调 ====================
 
         // 播放按钮点击事件
         private async void SysPlayButton_Click(object sender, RoutedEventArgs e)
@@ -431,6 +738,27 @@ namespace upper
             }
         }
 
+        // 连接按钮点击事件
+        private void ConnectButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_serialPortService.IsConnected)
+            {
+                // 如果已连接，则断开
+                _serialPortService.Disconnect();
+            }
+            else
+            {
+                // 否则尝试连接
+                AutoConnectDevice();
+            }
+        }
+
+        // 断开连接按钮点击事件
+        private void DisconnectButton_Click(object sender, RoutedEventArgs e)
+        {
+            _serialPortService.Disconnect();
+        }
+
 
 
         // ==================== 窗口事件处理 ====================
@@ -465,9 +793,6 @@ namespace upper
                 HideWindowToTray();
             }
         }
-
-
-
 
     }
 }

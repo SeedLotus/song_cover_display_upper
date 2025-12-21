@@ -8,9 +8,11 @@
         Title="唱片机控制器 - @realTiX" 
         Closing="Window_Closing"
         StateChanged="Window_StateChanged"
-        Height="370" Width="800">
+        Height="470" Width="800">
     <Grid Margin="10">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
@@ -48,14 +50,14 @@
                           Checked="AutoStartCheckBox_Checked" Unchecked="AutoStartCheckBox_Checked"/>
                     </Grid>
                     <!-- 标题 -->
-                    <TextBlock x:Name="TitleTextBlock" FontSize="22" FontWeight="Bold" 
+                    <TextBlock x:Name="TitleTextBlock" FontSize="22" FontWeight="Bold" Text="未知标题"
                        TextWrapping="Wrap" Margin="0,0,0,10" TextTrimming="CharacterEllipsis" MaxHeight="40"/>
                     <!-- 作者 -->
-                    <TextBlock x:Name="ArtistTextBlock" FontSize="16" Foreground="#555" 
+                    <TextBlock x:Name="ArtistTextBlock" FontSize="16" Foreground="#555" Text="未知作者"
                        TextWrapping="Wrap" Margin="0,0,0,10"/>
                     <!-- 专辑 -->
-                    <TextBlock x:Name="AlbumTextBlock" FontSize="14" Foreground="#777" 
-                       TextWrapping="Wrap"/>
+                    <TextBlock x:Name="AlbumTextBlock" FontSize="14" Foreground="#777" Text="未知专辑"
+                       TextWrapping="Wrap" Margin="0,0,0,10"/>
 
                     <!-- 
                     <StackPanel Orientation="Horizontal">
@@ -85,6 +87,35 @@
                     <!-- 传输状态信息 -->
                     <TextBlock x:Name="ImageTransferStatusText" Margin="0,10,0,0" FontSize="12" 
                    Foreground="Blue" TextWrapping="Wrap"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+
+        <TextBlock Grid.Row="2" Text="设备状态" FontSize="15" FontWeight="Bold" Margin="0,0,0,10"/>
+
+        <!-- 串口设备状态 -->
+        <Border Grid.Row="3" BorderBrush="LightGray" BorderThickness="1" Padding="10" CornerRadius="5" Margin="0,0,0,10">
+
+            <Grid >
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Orientation="Horizontal">
+                    <!-- 连接状态指示灯 -->
+                    <Ellipse x:Name="StatusLed" Width="16" Height="16" Fill="Red" 
+                     Margin="0,0,8,0" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="ConnectionStatusText" Text="设备未连接" 
+                       VerticalAlignment="Center" FontSize="14"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="10" HorizontalAlignment="Right">
+                    <Button x:Name="ConnectButton" Content="连接设备" Width="100" Height="30" 
+                            Click="ConnectButton_Click" Margin="0,0,10,0"/>
+                    <Button x:Name="DisconnectButton" Content="断开连接" Width="100" Height="30" 
+                            Click="DisconnectButton_Click" IsEnabled="False"/>
                 </StackPanel>
             </Grid>
         </Border>
