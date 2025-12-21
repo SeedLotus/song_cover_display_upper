@@ -38,18 +38,18 @@ namespace upper.Services
 
             var menu = new ContextMenuStrip();
 
-            var showItem = new ToolStripMenuItem("显示主窗口(&S)");
+            var showItem = new ToolStripMenuItem("显示主窗口");
             showItem.Click += (s, e) => TrayIconLeftClick?.Invoke(this, EventArgs.Empty);
             menu.Items.Add(showItem);
 
-            var websiteItem = new ToolStripMenuItem("作者B站(&W)");
+            var websiteItem = new ToolStripMenuItem("作者B站");
             websiteItem.Click += (s, e) => OpenUrlRequested?.Invoke(this, EventArgs.Empty);
             menu.Items.Add(websiteItem);
 
             // 分隔线
             menu.Items.Add(new ToolStripSeparator());
 
-            var exitItem = new ToolStripMenuItem("退出(&E)");
+            var exitItem = new ToolStripMenuItem("退出");
             exitItem.Click += (s, e) => ExitRequested?.Invoke(this, EventArgs.Empty);
             menu.Items.Add(exitItem);
 

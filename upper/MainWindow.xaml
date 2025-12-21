@@ -34,9 +34,19 @@
 
                 <!-- 歌曲信息与控制 -->
                 <StackPanel Grid.Column="1" VerticalAlignment="Center" Height="240">
-                    <!-- 播放状态 -->
-                    <TextBlock x:Name="StatusTextBlock" FontSize="16" Foreground="Blue" 
-                       Margin="0,0,0,15"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- 播放状态 -->
+                        <TextBlock Grid.Column="0" x:Name="StatusTextBlock" FontSize="16" Foreground="Blue" 
+                           Margin="0,0,0,10" Text="播放状态"/>
+                        <CheckBox Grid.Column="1" x:Name="AutoStartCheckBox" Content="开机自启动" 
+                          Margin="0,0,10,10" HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                          Checked="AutoStartCheckBox_Checked" Unchecked="AutoStartCheckBox_Checked"/>
+                    </Grid>
                     <!-- 标题 -->
                     <TextBlock x:Name="TitleTextBlock" FontSize="22" FontWeight="Bold" 
                        TextWrapping="Wrap" Margin="0,0,0,10" TextTrimming="CharacterEllipsis" MaxHeight="40"/>

@@ -22,13 +22,14 @@ namespace upper
         // ==================== 服务实例声明 ====================
         private readonly MediaService _mediaService; // 系统媒体
         private readonly TrayService _trayService; // 托盘化
-        private bool _isExitingFromTrayMenu = false;  // 是否从托盘菜单退出
+        private AutoStartManager _autoStartManager;
 
 
         // ==================== 状态管理字段 ====================
         private string? _currentPlayStatus;           // 当前播放状态
         private byte[]? _currentImageRgb565Data;      // 当前图片的RGB565编码数据
         private string? _lastImageHash;               // 上次图片哈希（用于变化检测）
+        private bool _isExitingFromTrayMenu = false;  // 是否从托盘菜单退出
 
 
         public MainWindow()
@@ -38,11 +39,13 @@ namespace upper
             // 初始化服务实例
             _mediaService = new MediaService();
             _trayService = new TrayService();
+            _autoStartManager = new AutoStartManager();
 
 
             // 初始化各模块
             InitializeMediaService();
             InitializeTrayService();
+            InitializeAutoStart();
         }
 
     // ==================== 服务初始化 ====================
@@ -75,14 +78,14 @@ namespace upper
                 // 可以用在 NotifyIcon 等需要文件路径的地方
                 Icon? _app_icon = new System.Drawing.Icon(iconPath);
 
-                _trayService.Initialize("系统媒体监听与串口控制", _app_icon);
+                _trayService.Initialize("唱片机控制器 - @realTiX", _app_icon);
                 // 使用后清理临时文件（可选）
                 // File.Delete(iconPath);
             }
             else
             {
                 // 配置托盘服务
-                _trayService.Initialize("系统媒体监听与串口控制");
+                _trayService.Initialize("唱片机控制器 - @realTiX");
             }
 
             // 订阅托盘事件
@@ -116,7 +119,32 @@ namespace upper
             return null;
         }
 
-    // ==================== 事件处理相关 ====================
+        // 初始化开机自启动功能
+        private void InitializeAutoStart()
+        {
+            try
+            {
+                // 检测当前状态
+                bool isEnabled = _autoStartManager.CheckStatus();
+
+                // 获取详细的EXE文件信息
+                string exeInfo = _autoStartManager.GetExeFileInfo();
+
+                // 更新UI
+                Dispatcher.Invoke(() =>
+                {
+                    AutoStartCheckBox.IsChecked = isEnabled;
+                });
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    AutoStartCheckBox.IsEnabled = false;
+                });
+            }
+        }
+        // ==================== 事件处理相关 ====================
 
         // ==================== 媒体事件处理 ====================
         // 媒体信息变化事件处理
@@ -353,8 +381,59 @@ namespace upper
             //ControlResultText.Foreground = success ? System.Windows.Media.Brushes.Green : System.Windows.Media.Brushes.Red;
         }
 
+        // 开机自启动复选框状态改变
+        private void AutoStartCheckBox_Checked(object sender, RoutedEventArgs e)
+        {
+            if (_autoStartManager == null) return;
 
-    // ==================== 窗口事件处理 ====================
+            bool isChecked = AutoStartCheckBox.IsChecked ?? false;
+
+            try
+            {
+                if (isChecked)
+                {
+                    // 启用开机自启动
+                    bool success = _autoStartManager.EnableAutoStart();
+
+                    if (success)
+                    {
+                        // 显示成功提示
+                        //System.Windows.MessageBox.Show("开机自启动已启用。\n\n启动文件夹: " +
+                        //    _autoStartManager.GetStartupFolderDisplayPath(),
+                        //    "设置成功",
+                        //    MessageBoxButton.OK,
+                        //    MessageBoxImage.Information);
+                    }
+                }
+                else
+                {
+                    // 禁用开机自启动
+                    bool success = _autoStartManager.DisableAutoStart();
+
+                    if (success)
+                    {
+                        // 成功禁用开机自启动
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // 恢复复选框状态
+                AutoStartCheckBox.IsChecked = !isChecked;
+
+                // 显示错误信息
+                string errorMessage = $"设置失败: {ex.Message}";
+
+                System.Windows.MessageBox.Show($"设置开机自启动失败:\n\n{ex.Message}",
+                    "设置失败",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+
+
+
+        // ==================== 窗口事件处理 ====================
 
         // 窗口关闭事件
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
