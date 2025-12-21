@@ -1,4 +1,5 @@
 ﻿using System.IO;
+using System.Reflection;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -8,7 +9,6 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Navigation;
-using System.Windows.Shapes;
 
 using upper.Services;
 
@@ -19,11 +19,13 @@ namespace upper
     /// </summary>
     public partial class MainWindow : Window
     {
-    // ==================== 服务实例声明 ====================
-        private readonly MediaService _mediaService;
+        // ==================== 服务实例声明 ====================
+        private readonly MediaService _mediaService; // 系统媒体
+        private readonly TrayService _trayService; // 托盘化
+        private bool _isExitingFromTrayMenu = false;  // 是否从托盘菜单退出
 
 
-    // ==================== 状态管理字段 ====================
+        // ==================== 状态管理字段 ====================
         private string? _currentPlayStatus;           // 当前播放状态
         private byte[]? _currentImageRgb565Data;      // 当前图片的RGB565编码数据
         private string? _lastImageHash;               // 上次图片哈希（用于变化检测）
@@ -35,10 +37,12 @@ namespace upper
 
             // 初始化服务实例
             _mediaService = new MediaService();
+            _trayService = new TrayService();
 
 
             // 初始化各模块
             InitializeMediaService();
+            InitializeTrayService();
         }
 
     // ==================== 服务初始化 ====================
@@ -60,6 +64,56 @@ namespace upper
                 //ControlStatusText.Text = "媒体服务初始化失败";
                 //ControlStatusText.Foreground = System.Windows.Media.Brushes.Red;
             }
+        }
+
+        // 初始化托盘服务
+        private void InitializeTrayService()
+        {
+            string iconPath = GetEmbeddedIconAsTempFile();
+            if (!string.IsNullOrEmpty(iconPath))
+            {
+                // 可以用在 NotifyIcon 等需要文件路径的地方
+                Icon? _app_icon = new System.Drawing.Icon(iconPath);
+
+                _trayService.Initialize("系统媒体监听与串口控制", _app_icon);
+                // 使用后清理临时文件（可选）
+                // File.Delete(iconPath);
+            }
+            else
+            {
+                // 配置托盘服务
+                _trayService.Initialize("系统媒体监听与串口控制");
+            }
+
+            // 订阅托盘事件
+            _trayService.TrayIconLeftClick += (s, e) => RestoreWindowFromTray();
+            _trayService.OpenUrlRequested += (s, e) => OpenWebsite();
+            _trayService.ExitRequested += (s, e) =>
+            {
+                _isExitingFromTrayMenu = true;
+                this.Close();
+            };
+        }
+
+        // 获取托盘图标
+        public string GetEmbeddedIconAsTempFile()
+        {
+            Assembly assembly = Assembly.GetExecutingAssembly();
+            string resourceName = "upper.Assets.icon.ico";
+            string tempFilePath = Path.Combine(Path.GetTempPath(), "icon.ico");
+
+            using (var stream = assembly.GetManifestResourceStream(resourceName))
+            {
+                if (stream != null)
+                {
+                    using (var fileStream = File.Create(tempFilePath))
+                    {
+                        stream.CopyTo(fileStream);
+                    }
+                    return tempFilePath;
+                }
+            }
+            return null;
         }
 
     // ==================== 事件处理相关 ====================
@@ -209,6 +263,73 @@ namespace upper
             }
         }
 
+        // ==================== 托盘事件处理 ====================
+
+        // 从托盘恢复窗口
+        public void RestoreWindowFromTray()
+        {
+            this.Show();
+            this.WindowState = WindowState.Normal;
+            this.Activate();
+
+            // 临时置顶以确保窗口显示在前面
+            this.Topmost = true;
+            this.Topmost = false;
+        }
+
+        // 隐藏窗口到托盘
+        private void HideWindowToTray()
+        {
+            this.Hide();
+            _trayService.ShowNotification("程序已最小化到托盘",
+                "单击托盘图标可恢复窗口",
+                System.Windows.Forms.ToolTipIcon.Info,
+                1000);
+        }
+
+        private void OpenWebsite()
+        {
+            string url = "https://space.bilibili.com/40194368";
+
+            try
+            {
+                // 使用系统默认浏览器打开URL
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = url,
+                    UseShellExecute = true  // 使用系统Shell执行，这样会调用默认浏览器
+                });
+            }
+            catch (Exception ex)
+            {
+                // 如果第一种方法失败，尝试另一种方法
+                try
+                {
+                    System.Diagnostics.Process.Start(url);
+                }
+                catch (Exception ex2)
+                {
+                    string errorMessage = $"无法打开浏览器: {ex2.Message}";
+
+                    // 显示错误消息
+                    System.Windows.MessageBox.Show(errorMessage + $"\n\n请手动访问: {url}",
+                        "浏览器打开失败",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+
+                    // 尝试复制URL到剪贴板，方便用户手动粘贴
+                    try
+                    {
+                        System.Windows.Clipboard.SetText(url);
+                    }
+                    catch
+                    {
+                        // 剪贴板复制失败
+                    }
+                }
+            }
+        }
+
 
 
 
@@ -233,7 +354,31 @@ namespace upper
         }
 
 
+    // ==================== 窗口事件处理 ====================
 
+        // 窗口关闭事件
+        private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
+        {
+            // 如果是从托盘菜单退出，则正常关闭
+            if (_isExitingFromTrayMenu)
+            {
+                return;
+            }
+
+            // 否则取消关闭操作，最小化到托盘
+            e.Cancel = true;
+            HideWindowToTray();
+        }
+
+        // 窗口状态改变事件
+        private void Window_StateChanged(object sender, EventArgs e)
+        {
+            // 当窗口最小化时，隐藏到托盘
+            if (this.WindowState == WindowState.Minimized && !_isExitingFromTrayMenu)
+            {
+                HideWindowToTray();
+            }
+        }
 
 
 

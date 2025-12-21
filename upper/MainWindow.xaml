@@ -5,7 +5,10 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:upper"
         mc:Ignorable="d"
-        Title="唱片机控制器 - @realTiX" Height="370" Width="800">
+        Title="唱片机控制器 - @realTiX" 
+        Closing="Window_Closing"
+        StateChanged="Window_StateChanged"
+        Height="370" Width="800">
     <Grid Margin="10">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
