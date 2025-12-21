@@ -359,6 +359,13 @@ namespace upper
         // 窗口关闭事件
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {
+            if (App.IsSecondInstance)
+            {
+                // 这是第二个实例，直接关闭，不需要隐藏到托盘
+                //e.Cancel = false; // 允许关闭
+                return;
+            }
+
             // 如果是从托盘菜单退出，则正常关闭
             if (_isExitingFromTrayMenu)
             {
