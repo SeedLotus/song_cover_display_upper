@@ -439,6 +439,7 @@ namespace upper
         // 串口状态消息事件处理
         private void OnSerialStatusMessage(object sender, string message)
         {
+            return;
             Dispatcher.Invoke(() =>
             {
             });

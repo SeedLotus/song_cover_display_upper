@@ -10,6 +10,7 @@ namespace upper.Services
         // 核心对象
         private GlobalSystemMediaTransportControlsSessionManager? _sessionManager;
         private GlobalSystemMediaTransportControlsSession? _currentSession;
+        private readonly object _sessionLock = new object(); // 添加锁来防止竞态条件
 
         // 公开的事件，供主窗口订阅
         public event EventHandler<MediaInfoChangedEventArgs>? MediaInfoChanged;
@@ -28,7 +29,7 @@ namespace upper.Services
         // 携带播放状态的事件参数
         public class PlaybackStateChangedEventArgs : EventArgs
         {
-            public string State { get; set; } = string.Empty; // "Playing", "Paused", "Stopped"
+            public string State { get; set; } = string.Empty; // "Playing", "Paused", "Stopped", "Changing"
             public bool IsPlaying => State == "Playing";
             public bool IsPaused => State == "Paused";
         }
@@ -58,7 +59,7 @@ namespace upper.Services
             {
                 System.Diagnostics.Debug.WriteLine($"MediaService初始化失败: {ex.Message}");
                 OnSessionAvailabilityChanged(false);
-                throw; // 可以选择向上抛出或静默处理
+                // 可以选择不抛出，而是通知上层初始化失败
             }
         }
 
@@ -69,25 +70,49 @@ namespace upper.Services
         {
             if (_sessionManager == null) return;
 
-            // 清理之前的会话监听
-            if (_currentSession != null)
+            GlobalSystemMediaTransportControlsSession? oldSession = null;
+            GlobalSystemMediaTransportControlsSession? newSession = null;
+
+            lock (_sessionLock)
             {
-                _currentSession.MediaPropertiesChanged -= OnMediaPropertiesChanged;
-                _currentSession.PlaybackInfoChanged -= OnPlaybackInfoChanged;
+                // 保存旧会话引用
+                oldSession = _currentSession;
+
+                // 获取新的当前会话
+                newSession = _sessionManager.GetCurrentSession();
+                _currentSession = newSession;
             }
 
-            // 获取新的当前会话
-            _currentSession = _sessionManager.GetCurrentSession();
-
-            if (_currentSession != null)
+            // 清理旧会话监听（在锁外执行，避免死锁）
+            if (oldSession != null)
             {
-                // 监听当前会话的变化
-                _currentSession.MediaPropertiesChanged += OnMediaPropertiesChanged;
-                _currentSession.PlaybackInfoChanged += OnPlaybackInfoChanged;
+                await SafeUnsubscribeEvents(oldSession);
+            }
 
-                // 立即获取一次当前信息
-                await UpdateMediaInfoAsync();
-                await UpdatePlaybackInfoAsync();
+            if (newSession != null)
+            {
+                try
+                {
+                    // 监听当前会话的变化
+                    newSession.MediaPropertiesChanged += OnMediaPropertiesChanged;
+                    newSession.PlaybackInfoChanged += OnPlaybackInfoChanged;
+
+                    // 立即获取一次当前信息
+                    await UpdateMediaInfoAsync();
+                    await UpdatePlaybackInfoAsync();
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"设置新会话监听失败: {ex.Message}");
+                    // 如果设置失败，清理_currentSession
+                    lock (_sessionLock)
+                    {
+                        if (_currentSession == newSession)
+                        {
+                            _currentSession = null;
+                        }
+                    }
+                }
             }
             else
             {
@@ -98,11 +123,40 @@ namespace upper.Services
         }
 
         /// <summary>
+        /// 安全地取消订阅会话事件
+        /// </summary>
+        private Task SafeUnsubscribeEvents(GlobalSystemMediaTransportControlsSession session)
+        {
+            if (session == null) return Task.CompletedTask;
+
+            try
+            {
+                // 尝试取消订阅所有事件，如果会话已释放，会抛出异常
+                session.MediaPropertiesChanged -= OnMediaPropertiesChanged;
+                session.PlaybackInfoChanged -= OnPlaybackInfoChanged;
+            }
+            catch (Exception ex)
+            {
+                // 这里捕获异常是因为会话可能已经被释放
+                System.Diagnostics.Debug.WriteLine($"取消订阅会话事件失败（可能是会话已释放）: {ex.Message}");
+            }
+
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
         /// 当前会话改变时的处理
         /// </summary>
         private async Task OnCurrentSessionChangedAsync()
         {
-            await SetupCurrentSessionAsync();
+            try
+            {
+                await SetupCurrentSessionAsync();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"处理会话变更时出错: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -111,7 +165,24 @@ namespace upper.Services
         private async void OnMediaPropertiesChanged(GlobalSystemMediaTransportControlsSession sender,
             MediaPropertiesChangedEventArgs args)
         {
-            await UpdateMediaInfoAsync();
+            try
+            {
+                // 验证发送者是否仍然是当前会话
+                lock (_sessionLock)
+                {
+                    if (sender != _currentSession)
+                    {
+                        // 如果不是当前会话的事件，忽略
+                        return;
+                    }
+                }
+
+                await UpdateMediaInfoAsync();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"处理媒体属性变化时出错: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -120,7 +191,24 @@ namespace upper.Services
         private async void OnPlaybackInfoChanged(GlobalSystemMediaTransportControlsSession sender,
             object args)
         {
-            await UpdatePlaybackInfoAsync();
+            try
+            {
+                // 验证发送者是否仍然是当前会话
+                lock (_sessionLock)
+                {
+                    if (sender != _currentSession)
+                    {
+                        // 如果不是当前会话的事件，忽略
+                        return;
+                    }
+                }
+
+                await UpdatePlaybackInfoAsync();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"处理播放状态变化时出错: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -128,11 +216,18 @@ namespace upper.Services
         /// </summary>
         private async Task UpdateMediaInfoAsync()
         {
-            if (_currentSession == null) return;
+            GlobalSystemMediaTransportControlsSession? currentSession;
+
+            lock (_sessionLock)
+            {
+                currentSession = _currentSession;
+            }
+
+            if (currentSession == null) return;
 
             try
             {
-                var mediaProperties = await _currentSession.TryGetMediaPropertiesAsync();
+                var mediaProperties = await currentSession.TryGetMediaPropertiesAsync();
 
                 var eventArgs = new MediaInfoChangedEventArgs
                 {
@@ -155,11 +250,18 @@ namespace upper.Services
         /// </summary>
         private async Task UpdatePlaybackInfoAsync()
         {
-            if (_currentSession == null) return;
+            GlobalSystemMediaTransportControlsSession? currentSession;
+
+            lock (_sessionLock)
+            {
+                currentSession = _currentSession;
+            }
+
+            if (currentSession == null) return;
 
             try
             {
-                var playbackInfo = _currentSession.GetPlaybackInfo();
+                var playbackInfo = currentSession.GetPlaybackInfo();
                 string state = playbackInfo.PlaybackStatus.ToString();
 
                 OnPlaybackStateChanged(state);
@@ -167,6 +269,8 @@ namespace upper.Services
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"获取播放状态失败: {ex.Message}");
+                // 如果获取失败，可能是会话已无效
+                OnPlaybackStateChanged("NoSession");
             }
         }
 
@@ -177,11 +281,18 @@ namespace upper.Services
         /// </summary>
         public async Task<bool> TryPlayAsync()
         {
-            if (_currentSession == null) return false;
+            GlobalSystemMediaTransportControlsSession? currentSession;
+
+            lock (_sessionLock)
+            {
+                currentSession = _currentSession;
+            }
+
+            if (currentSession == null) return false;
 
             try
             {
-                return await _currentSession.TryPlayAsync();
+                return await currentSession.TryPlayAsync();
             }
             catch (Exception ex)
             {
@@ -195,11 +306,18 @@ namespace upper.Services
         /// </summary>
         public async Task<bool> TryPauseAsync()
         {
-            if (_currentSession == null) return false;
+            GlobalSystemMediaTransportControlsSession? currentSession;
+
+            lock (_sessionLock)
+            {
+                currentSession = _currentSession;
+            }
+
+            if (currentSession == null) return false;
 
             try
             {
-                return await _currentSession.TryPauseAsync();
+                return await currentSession.TryPauseAsync();
             }
             catch (Exception ex)
             {
@@ -213,11 +331,18 @@ namespace upper.Services
         /// </summary>
         public async Task<bool> TrySkipNextAsync()
         {
-            if (_currentSession == null) return false;
+            GlobalSystemMediaTransportControlsSession? currentSession;
+
+            lock (_sessionLock)
+            {
+                currentSession = _currentSession;
+            }
+
+            if (currentSession == null) return false;
 
             try
             {
-                return await _currentSession.TrySkipNextAsync();
+                return await currentSession.TrySkipNextAsync();
             }
             catch (Exception ex)
             {
@@ -231,11 +356,18 @@ namespace upper.Services
         /// </summary>
         public async Task<bool> TrySkipPreviousAsync()
         {
-            if (_currentSession == null) return false;
+            GlobalSystemMediaTransportControlsSession? currentSession;
+
+            lock (_sessionLock)
+            {
+                currentSession = _currentSession;
+            }
+
+            if (currentSession == null) return false;
 
             try
             {
-                return await _currentSession.TrySkipPreviousAsync();
+                return await currentSession.TrySkipPreviousAsync();
             }
             catch (Exception ex)
             {
@@ -248,17 +380,38 @@ namespace upper.Services
 
         protected virtual void OnMediaInfoChanged(MediaInfoChangedEventArgs? args)
         {
-            MediaInfoChanged?.Invoke(this, args ?? new MediaInfoChangedEventArgs());
+            try
+            {
+                MediaInfoChanged?.Invoke(this, args ?? new MediaInfoChangedEventArgs());
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"触发MediaInfoChanged事件时出错: {ex.Message}");
+            }
         }
 
         protected virtual void OnPlaybackStateChanged(string state)
         {
-            PlaybackStateChanged?.Invoke(this, new PlaybackStateChangedEventArgs { State = state });
+            try
+            {
+                PlaybackStateChanged?.Invoke(this, new PlaybackStateChangedEventArgs { State = state });
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"触发PlaybackStateChanged事件时出错: {ex.Message}");
+            }
         }
 
         protected virtual void OnSessionAvailabilityChanged(bool isAvailable)
         {
-            SessionAvailabilityChanged?.Invoke(this, isAvailable);
+            try
+            {
+                SessionAvailabilityChanged?.Invoke(this, isAvailable);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"触发SessionAvailabilityChanged事件时出错: {ex.Message}");
+            }
         }
 
         // ==================== 资源清理 ====================
@@ -272,10 +425,25 @@ namespace upper.Services
                 if (disposing)
                 {
                     // 清理托管资源
-                    if (_currentSession != null)
+                    GlobalSystemMediaTransportControlsSession? sessionToCleanup;
+
+                    lock (_sessionLock)
                     {
-                        _currentSession.MediaPropertiesChanged -= OnMediaPropertiesChanged;
-                        _currentSession.PlaybackInfoChanged -= OnPlaybackInfoChanged;
+                        sessionToCleanup = _currentSession;
+                        _currentSession = null;
+                    }
+
+                    if (sessionToCleanup != null)
+                    {
+                        try
+                        {
+                            sessionToCleanup.MediaPropertiesChanged -= OnMediaPropertiesChanged;
+                            sessionToCleanup.PlaybackInfoChanged -= OnPlaybackInfoChanged;
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"清理会话事件时出错: {ex.Message}");
+                        }
                     }
                 }
                 _disposed = true;
