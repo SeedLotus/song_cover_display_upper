@@ -87,64 +87,176 @@ namespace upper.Services
 
         // ==================== 设备发现与连接 ====================
 
-        /// <summary>
-        /// 根据VID和PID查找COM端口
+        /// 根据VID和PID查找当前连接的COM端口（增强版）
         /// </summary>
         /// <param name="vid">供应商ID（16进制，如"2E3C"）</param>
         /// <param name="pid">产品ID（16进制，如"2568"）</param>
-        /// <returns>找到的COM端口列表</returns>
+        /// <returns>找到的、当前可用的COM端口列表</returns>
         public List<string> FindComPortsByVidPid(string vid, string pid)
         {
             var comports = new List<string>();
+            // 构建正则表达式，匹配类似 VID_2E3C&PID_2568 的格式
             string pattern = $"^VID_{vid}.PID_{pid}";
             var rx = new Regex(pattern, RegexOptions.IgnoreCase);
 
             try
             {
-                using (RegistryKey? baseKey = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum"))
+                // --- 搜索路径1: 标准设备枚举路径 (主要路径) ---
+                SearchRegistryForComPorts(@"SYSTEM\CurrentControlSet\Enum", rx, comports);
+
+                // --- 搜索路径2: COM端口仲裁器路径 (用于某些USB串口设备) ---
+                // 这个路径下存储了当前活动的COM端口映射，更直接。
+                using (RegistryKey? comKey = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\COM Name Arbiter\Devices"))
                 {
-                    if (baseKey == null) return comports;
-
-                    foreach (string deviceCategory in baseKey.GetSubKeyNames())
+                    if (comKey != null)
                     {
-                        using (RegistryKey? categoryKey = baseKey.OpenSubKey(deviceCategory))
+                        // 这个键值下，值是COM端口名（如COM3），键名是设备实例路径，其中包含VID&PID
+                        foreach (string deviceInstanceId in comKey.GetValueNames())
                         {
-                            if (categoryKey == null) continue;
-
-                            foreach (string deviceId in categoryKey.GetSubKeyNames())
+                            if (rx.IsMatch(deviceInstanceId))
                             {
-                                if (!rx.Match(deviceId).Success) continue;
-
-                                using (RegistryKey? deviceKey = categoryKey.OpenSubKey(deviceId))
+                                object? portNameValue = comKey.GetValue(deviceInstanceId);
+                                if (portNameValue != null)
                                 {
-                                    if (deviceKey == null) continue;
-
-                                    foreach (string instance in deviceKey.GetSubKeyNames())
+                                    string portName = portNameValue.ToString()!;
+                                    // 去重添加
+                                    if (!comports.Contains(portName))
                                     {
-                                        using (RegistryKey? instanceKey = deviceKey.OpenSubKey(instance))
-                                        using (RegistryKey? deviceParams = instanceKey?.OpenSubKey("Device Parameters"))
-                                        {
-                                            object? portNameValue = deviceParams?.GetValue("PortName");
-                                            if (portNameValue != null)
-                                            {
-                                                string portName = portNameValue.ToString()!;
-                                                if (!comports.Contains(portName))
-                                                    comports.Add(portName);
-                                            }
-                                        }
+                                        comports.Add(portName);
                                     }
                                 }
                             }
                         }
                     }
                 }
+
+                OnStatusMessage($"初步找到 {comports.Count} 个匹配端口: {string.Join(", ", comports)}");
+
+                // --- 关键步骤：验证端口当前是否真正可用 ---
+                // 仅存在于注册表不代表物理设备一定连接着。
+                // 这里尝试过滤掉可能已被占用或不存在的端口。
+                var availablePorts = new List<string>();
+                foreach (var port in comports)
+                {
+                    if (IsPortAvailable(port))
+                    {
+                        availablePorts.Add(port);
+                    }
+                    else
+                    {
+                        OnStatusMessage($"端口 {port} 在列表中但当前不可用，已过滤。");
+                    }
+                }
+
+                return availablePorts;
             }
             catch (Exception ex)
             {
-                OnStatusMessage($"查询注册表出错: {ex.Message}");
+                OnStatusMessage($"查询注册表时发生异常: {ex.Message}");
+                return comports; // 返回已找到的部分，或空列表
             }
+        }
 
-            return comports;
+        /// <summary>
+        /// 在指定的注册表根路径下递归搜索匹配的设备
+        /// </summary>
+        private void SearchRegistryForComPorts(string basePath, Regex vidPidRegex, List<string> foundPorts)
+        {
+            try
+            {
+                using (RegistryKey? baseKey = Registry.LocalMachine.OpenSubKey(basePath))
+                {
+                    if (baseKey == null) return;
+
+                    // 遍历第一层子键（通常是设备大类，如USB）
+                    foreach (string subKeyName in baseKey.GetSubKeyNames())
+                    {
+                        try
+                        {
+                            using (RegistryKey? subKey = baseKey.OpenSubKey(subKeyName))
+                            {
+                                if (subKey == null) continue;
+
+                                // 遍历第二层子键（具体的设备实例ID）
+                                foreach (string deviceKeyName in subKey.GetSubKeyNames())
+                                {
+                                    // 检查设备实例ID是否匹配VID&PID
+                                    if (!vidPidRegex.IsMatch(deviceKeyName)) continue;
+
+                                    // 找到匹配设备，深入查找其“Device Parameters”下的PortName
+                                    using (RegistryKey? deviceKey = subKey.OpenSubKey(deviceKeyName))
+                                    {
+                                        if (deviceKey == null) continue;
+
+                                        // 一个物理设备可能有多个逻辑实例（如不同的接口）
+                                        foreach (string instanceKeyName in deviceKey.GetSubKeyNames())
+                                        {
+                                            try
+                                            {
+                                                using (RegistryKey? instanceKey = deviceKey.OpenSubKey(instanceKeyName))
+                                                using (RegistryKey? deviceParams = instanceKey?.OpenSubKey("Device Parameters"))
+                                                {
+                                                    object? portNameValue = deviceParams?.GetValue("PortName");
+                                                    if (portNameValue != null)
+                                                    {
+                                                        string portName = portNameValue.ToString()!;
+                                                        if (!foundPorts.Contains(portName))
+                                                        {
+                                                            foundPorts.Add(portName);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                // 忽略单个实例访问错误，继续查找其他
+                                                System.Diagnostics.Debug.WriteLine($"访问实例 {instanceKeyName} 时出错: {ex.Message}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            // 忽略单个子键访问错误，继续查找其他
+                            System.Diagnostics.Debug.WriteLine($"访问子键 {subKeyName} 时出错: {ex.Message}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                OnStatusMessage($"搜索路径 {basePath} 时出错: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 验证串口是否真的可以打开（即设备已连接且未被占用）
+        /// </summary>
+        private bool IsPortAvailable(string portName)
+        {
+            // 最简单直接的方法：尝试用 SerialPort 打开再关闭。
+            // 注意：这只是为了验证存在性，不是真正的连接。
+            using (var testPort = new SerialPort(portName))
+            {
+                try
+                {
+                    testPort.Open();
+                    // 如果能成功打开，说明端口存在且当前空闲
+                    return true;
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // 端口存在，但被其他程序占用
+                    return false;
+                }
+                catch (Exception)
+                {
+                    // 其他异常（如端口不存在）
+                    return false;
+                }
+            }
         }
 
         /// <summary>
