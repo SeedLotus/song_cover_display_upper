@@ -33,10 +33,9 @@
   * Github：[TiX233/song_cover_display_upper](https://github.com/TiX233/song_cover_display_upper)
   * Gitee：[TiX233/song_cover_display_upper](https://gitee.com/TiX233/song_cover_display_upper)
 * 原理图/PCB：
-  * 立创开源平台：
+  * 立创开源平台：[歌曲封面显示唱片机](https://oshwhub.com/realtix/cover_display)
 * 外壳：
-  * MakerWorld：
-  * PCB 开源页面附件
+  * MakerWorld：[@realTiX - 电脑歌曲封面显示器唱片机](https://makerworld.com.cn/zh/models/1979900-dian-nao-ge-qu-feng-mian-xian-shi-chang-pian-ji)
 
 ## 三、项目简介
 
