@@ -24,6 +24,11 @@ namespace upper.Services
         private readonly object _serialLock = new object();
         private bool _disposed = false;
 
+        // 接收帧缓冲区
+        private readonly List<byte> _receiveBuffer = new();
+        private readonly object _bufferLock = new();
+        private const int MAX_RECEIVE_BUFFER_SIZE = 1024;
+
         // 连接状态
         private bool _isConnected = false;
         private string? _connectedPort;
@@ -33,6 +38,7 @@ namespace upper.Services
         public event EventHandler<string>? StatusMessage;
         public event EventHandler<DataReceivedEventArgs>? DataReceived;
         public event EventHandler<ImagePacketEventArgs>? ImagePacketSent;
+        public event EventHandler<SerialCommandReceivedEventArgs>? SerialCommandReceived;
 
         // 事件参数类
         public class DataReceivedEventArgs : EventArgs
@@ -52,8 +58,24 @@ namespace upper.Services
             public string? ErrorMessage { get; set; }
         }
 
+        // 结构化串口命令事件参数
+        public class SerialCommandReceivedEventArgs : EventArgs
+        {
+            /// <summary>命令文本，例如 "/q1"、"/k"、"/r1234"</summary>
+            public string CommandText { get; set; } = string.Empty;
+
+            /// <summary>命令类型字符，即 '/' 后的第一个字符</summary>
+            public char CommandType { get; set; }
+
+            /// <summary>/r 或 /x 命令携带的包序号</summary>
+            public ushort PacketIndex { get; set; }
+
+            /// <summary>原始帧字节，包含结尾的 '\n'</summary>
+            public byte[] RawFrame { get; set; } = Array.Empty<byte>();
+        }
+
         // 属性
-        public bool IsConnected => _isConnected;
+        public bool IsConnected => _serialPort?.IsOpen == true && _isConnected;
         public string? ConnectedPort => _connectedPort;
         public string? LastError { get; private set; }
 
@@ -324,7 +346,6 @@ namespace upper.Services
                     // 尝试打开串口
                     _serialPort.Open();
 
-                    _isConnected = true;
                     _connectedPort = portName;
                     LastError = null;
 
@@ -364,14 +385,14 @@ namespace upper.Services
                         _serialPort.Close();
                         OnStatusMessage("串口连接已关闭");
                     }
-
-                    _isConnected = false;
-                    _connectedPort = null;
-                    UpdateConnectionState(false);
                 }
                 catch (Exception ex)
                 {
                     OnStatusMessage($"断开连接时出错: {ex.Message}");
+                }
+                finally
+                {
+                    UpdateConnectionState(false);
                 }
             }
         }
@@ -585,57 +606,114 @@ namespace upper.Services
 
                 byte[] buffer = new byte[bytesToRead];
                 int bytesRead = _serialPort.Read(buffer, 0, bytesToRead);
+                if (bytesRead <= 0) return;
 
-                // 处理接收到的数据
-                ProcessReceivedData(buffer, bytesRead);
+                var rawData = buffer.Take(bytesRead).ToArray();
+
+                // 保留原始调试事件
+                OnDataReceived(new DataReceivedEventArgs
+                {
+                    RawData = rawData,
+                    ReceivedTime = DateTime.Now
+                });
+
+                // 追加到接收缓冲区并尝试解析完整帧
+                lock (_bufferLock)
+                {
+                    _receiveBuffer.AddRange(rawData);
+                    ProcessCommandBuffer();
+                }
             }
             catch (Exception ex)
             {
                 OnStatusMessage($"接收数据出错: {ex.Message}");
+                if (ex is System.IO.IOException || ex is InvalidOperationException)
+                {
+                    Disconnect();
+                }
             }
         }
 
         /// <summary>
-        /// 处理接收到的数据
+        /// 处理接收缓冲区：按 '\n' 拆分完整帧并解析命令
         /// </summary>
-        private void ProcessReceivedData(byte[] data, int length)
+        private void ProcessCommandBuffer()
         {
-            if (length <= 0) return;
-
-            string asciiString = Encoding.ASCII.GetString(data, 0, length);
-
-            // 触发数据接收事件
-            OnDataReceived(new DataReceivedEventArgs
+            while (true)
             {
-                RawData = data.Take(length).ToArray(),
-                AsciiString = asciiString,
-                ReceivedTime = DateTime.Now
-            });
+                int nlIndex = _receiveBuffer.IndexOf((byte)'\n');
+                if (nlIndex < 0) break;
 
-            // 自动检测常见命令（可选，主窗口也可以处理）
-            AutoDetectCommands(asciiString);
+                byte[] frame = _receiveBuffer.Take(nlIndex + 1).ToArray();
+                _receiveBuffer.RemoveRange(0, nlIndex + 1);
+
+                // 仅处理以 '/' 开头的命令帧
+                if (frame.Length >= 2 && frame[0] == (byte)'/')
+                {
+                    ParseAndRaiseCommand(frame);
+                }
+            }
+
+            // 防止异常数据无限堆积
+            if (_receiveBuffer.Count > MAX_RECEIVE_BUFFER_SIZE)
+            {
+                _receiveBuffer.Clear();
+                OnStatusMessage("接收缓冲区超出安全上限，已清空");
+            }
         }
 
         /// <summary>
-        /// 自动检测常见命令（供调试用）
+        /// 解析单条命令帧并触发结构化事件
         /// </summary>
-        private void AutoDetectCommands(string data)
+        private void ParseAndRaiseCommand(byte[] frame)
         {
-            if (data.Contains("/k"))
+            var args = new SerialCommandReceivedEventArgs
             {
-                OnStatusMessage("收到下位机就绪响应: /k");
+                RawFrame = frame,
+                CommandType = (char)frame[1]
+            };
+
+            switch (args.CommandType)
+            {
+                case 'q':
+                    if (frame.Length >= 3 && (frame[2] == (byte)'0' || frame[2] == (byte)'1'))
+                    {
+                        args.CommandText = $"/q{(char)frame[2]}";
+                    }
+                    break;
+
+                case 'k':
+                    args.CommandText = "/k";
+                    break;
+
+                case 'a':
+                    args.CommandText = "/a";
+                    break;
+
+                case 'r':
+                case 'x':
+                    if (frame.Length >= 5)
+                    {
+                        args.PacketIndex = (ushort)((frame[2] << 8) | frame[3]);
+                        args.CommandText = $"/{args.CommandType}{args.PacketIndex}";
+                    }
+                    break;
+
+                case 'e':
+                    if (frame.Length >= 3)
+                    {
+                        args.CommandText = $"/e{(char)frame[2]}";
+                    }
+                    break;
+
+                default:
+                    args.CommandText = $"/{args.CommandType}";
+                    break;
             }
-            else if (data.Contains("/r"))
+
+            if (!string.IsNullOrEmpty(args.CommandText))
             {
-                OnStatusMessage("收到重传单个包请求: /r");
-            }
-            else if (data.Contains("/x"))
-            {
-                OnStatusMessage("收到重传后续包请求: /x");
-            }
-            else if (data.Contains("/q0") || data.Contains("/q1"))
-            {
-                OnStatusMessage($"收到播放控制命令: {data.Trim()}");
+                OnSerialCommandReceived(args);
             }
         }
 
@@ -704,13 +782,22 @@ namespace upper.Services
             ImagePacketSent?.Invoke(this, e);
         }
 
+        protected virtual void OnSerialCommandReceived(SerialCommandReceivedEventArgs e)
+        {
+            SerialCommandReceived?.Invoke(this, e);
+        }
+
         private void UpdateConnectionState(bool isConnected)
         {
-            //if (_isConnected != isConnected)
-            //{
-                //_isConnected = isConnected;
+            if (_isConnected != isConnected)
+            {
+                _isConnected = isConnected;
+                if (!isConnected)
+                {
+                    _connectedPort = null;
+                }
                 OnConnectionStateChanged(isConnected);
-            //}
+            }
         }
 
         // ==================== 资源清理 ====================
