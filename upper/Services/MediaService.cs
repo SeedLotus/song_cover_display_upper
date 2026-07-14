@@ -376,6 +376,23 @@ namespace upper.Services
             }
         }
 
+        /// <summary>
+        /// 尝试重新设置当前媒体会话，用于后台会话可能失效时的刷新
+        /// </summary>
+        public async Task RefreshCurrentSessionAsync()
+        {
+            if (_sessionManager == null) return;
+
+            try
+            {
+                await SetupCurrentSessionAsync();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"刷新媒体会话失败: {ex.Message}");
+            }
+        }
+
         // ==================== 事件触发方法 ====================
 
         protected virtual void OnMediaInfoChanged(MediaInfoChangedEventArgs? args)
