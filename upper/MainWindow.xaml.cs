@@ -219,7 +219,8 @@ namespace upper
             // 处理专辑封面（如果有）
             if (e.ThumbnailStream is Windows.Storage.Streams.IRandomAccessStreamReference thumbnailRef)
             {
-                await ProcessAlbumArtAsync(thumbnailRef);
+                // 图片处理涉及大量 DispatcherObject，统一放到 UI 线程执行
+                await Dispatcher.InvokeAsync(async () => await ProcessAlbumArtAsync(thumbnailRef));
             }
             else
             {
@@ -243,17 +244,15 @@ namespace upper
                 StatusTextBlock.Text = $"状态: {GetPlaybackStatusString(e.State)}";
 
                 // 根据播放状态更新按钮可用性
-                // 播放中时禁用播放按钮，启用暂停按钮
-                // 暂停/停止时启用播放按钮，禁用暂停按钮
                 bool isPlaying = e.State == "Playing";
                 SysPlayButton.IsEnabled = !isPlaying;
                 SysPauseButton.IsEnabled = isPlaying;
 
-                //ControlResultText.Text = isPlaying ? "正在播放" : "已暂停";
-                //ControlResultText.Foreground = isPlaying ? System.Windows.Media.Brushes.Green : System.Windows.Media.Brushes.Orange;
-
-                // 发送播放状态给下位机
-                //_serialPortService.SendPlaybackStatus(isPlaying);
+                // 播放状态变化时立即通知下位机，而不是等 1 秒定时器
+                if (_serialPortService.IsConnected)
+                {
+                    _serialPortService.SendPlaybackStatus(isPlaying);
+                }
             });
         }
 
@@ -350,6 +349,7 @@ namespace upper
                     AlbumArtImage.Source = ImageProcessor.CreatePlaceholderImage();
                     _currentImageRgb565Data = null;
                     _lastImageHash = null;
+                    ImageTransferStatusText.Text = $"封面处理失败: {ex.Message}";
                 });
             }
         }
@@ -425,9 +425,9 @@ namespace upper
         // ==================== 串口事件处理 ====================
 
         // 串口连接状态变化事件处理
-        private void OnSerialConnectionChanged(object sender, bool isConnected)
+        private async void OnSerialConnectionChanged(object sender, bool isConnected)
         {
-            Dispatcher.Invoke(() =>
+            await Dispatcher.InvokeAsync(async () =>
             {
                 // 更新连接状态指示灯
                 StatusLed.Fill = isConnected ? System.Windows.Media.Brushes.LimeGreen : System.Windows.Media.Brushes.Red;
@@ -436,16 +436,48 @@ namespace upper
                     : "设备未连接";
 
                 // 更新按钮状态
-                //ConnectButton.Content = isConnected ? "重新连接" : "连接设备";
                 ConnectButton.IsEnabled = !isConnected;
                 DisconnectButton.IsEnabled = isConnected;
-                //SendImageButton.IsEnabled = isConnected && (_currentImageRgb565Data != null);
 
                 // 启动或停止状态发送定时器
                 if (isConnected)
                 {
                     _statusSendTimer.Start();
                     _autoReconnectTimer.IsEnabled = false; // 连接成功时关闭自动重连
+
+                    // 重连后如果已有封面数据，延迟等 USB 枚举/CDC 初始化稳定再发送
+                    if (_currentImageRgb565Data != null)
+                    {
+                        lock (_imageTransferLock)
+                        {
+                            _imageTransferCts?.Cancel();
+                            _imagePhase = ImageTransferPhase.Idle;
+                            _pendingImageData = null;
+                        }
+
+                        ImageTransferStatusText.Text = "连接成功，4 秒后同步封面...";
+                        await Task.Delay(4000);
+
+                        if (!_serialPortService.IsConnected)
+                        {
+                            ImageTransferStatusText.Text = "同步前连接已断开，取消本次同步";
+                            return;
+                        }
+
+                        // 先发送 /0 唤醒并稳定下位机状态，等待唱臂状态机完成过渡
+                        ImageTransferStatusText.Text = "发送 /0 唤醒下位机，等待 1 秒稳定...";
+                        _serialPortService.SendPlaybackStatus(false);
+                        await Task.Delay(1000);
+
+                        if (!_serialPortService.IsConnected)
+                        {
+                            ImageTransferStatusText.Text = "同步前连接已断开，取消本次同步";
+                            return;
+                        }
+
+                        ImageTransferStatusText.Text = "开始同步封面到重连后的设备...";
+                        StartImageTransfer(_currentImageRgb565Data, kRetryCount: 8);
+                    }
                 }
                 else
                 {
@@ -458,9 +490,10 @@ namespace upper
         // 串口状态消息事件处理
         private void OnSerialStatusMessage(object sender, string message)
         {
-            return;
-            Dispatcher.Invoke(() =>
+            // 将串口状态消息显示在 UI 上，便于现场诊断
+            Dispatcher.InvokeAsync(() =>
             {
+                ImageTransferStatusText.Text = message;
             });
         }
 
@@ -477,12 +510,14 @@ namespace upper
             {
                 case "/q1":
                     // 下位机请求播放命令
+                    ImageTransferStatusText.Text = "收到 /q1，请求播放";
                     _serialPortService.SendPlaybackStatus(true);
                     _ = _mediaService.TryPlayAsync();
                     break;
 
                 case "/q0":
                     // 下位机请求暂停命令
+                    ImageTransferStatusText.Text = "收到 /q0，请求暂停";
                     _serialPortService.SendPlaybackStatus(false);
                     _ = _mediaService.TryPauseAsync();
                     break;
@@ -515,16 +550,20 @@ namespace upper
         // ==================== 图片传输状态机 ====================
 
         // 启动一次新的图片传输
-        private void StartImageTransfer(byte[] imageData)
+        private void StartImageTransfer(byte[] imageData, int kRetryCount = 2)
         {
             ulong currentTransferId;
 
             lock (_imageTransferLock)
             {
-                // 取消仍在进行中的旧传输
+                // 如果当前正在传输，先排队为 pending 并请求取消当前传输，
+                // 等当前传输自然结束（收到 /a 或超时）后再启动新传输，
+                // 避免向下位机发送重叠的 /t 命令。
                 if (_imagePhase != ImageTransferPhase.Idle)
                 {
+                    _pendingImageData = imageData;
                     _imageTransferCts?.Cancel();
+                    return;
                 }
 
                 _transferId++;
@@ -545,11 +584,11 @@ namespace upper
                 return;
             }
 
-            ImageTransferStatusText.Text = $"准备传输图片 (transfer {currentTransferId})...";
+            ImageTransferStatusText.Text = $"准备传输图片 (transfer {currentTransferId})，发送 /t 等待 /k...";
             _serialPortService.SendImageStartCommand();
 
-            // 3 秒内未收到 /k 则超时
-            _ = WaitForPhaseTimeoutAsync(currentTransferId, ImageTransferPhase.Starting, 3000);
+            // /k 可能因下位机 TX 忙而丢失；主动重试 /t，若仍未收到 /k 则直接开始发图
+            _ = WaitForKWithRetryAsync(currentTransferId, _imageTransferCts.Token, kRetryCount);
         }
 
         // 收到 /k：下位机已准备好接收图片
@@ -561,7 +600,11 @@ namespace upper
 
             lock (_imageTransferLock)
             {
-                if (_imagePhase != ImageTransferPhase.Starting) return;
+                if (_imagePhase != ImageTransferPhase.Starting)
+                {
+                    ImageTransferStatusText.Text = $"收到 /k 但状态为 {_imagePhase}，忽略";
+                    return;
+                }
 
                 transferId = _transferId;
                 imageData = _imageDataBeingSent;
@@ -571,6 +614,7 @@ namespace upper
 
             if (imageData == null) return;
 
+            ImageTransferStatusText.Text = "收到 /k，开始发送图片包...";
             _ = SendImageAsync(transferId, imageData, cts?.Token ?? default);
         }
 
@@ -615,8 +659,8 @@ namespace upper
 
                 _serialPortService.SendImageEndCommand();
 
-                // 2 秒内未收到 /a 则超时
-                _ = WaitForPhaseTimeoutAsync(transferId, ImageTransferPhase.AwaitingAck, 2000);
+                // 1000ms 内未收到 /a 则超时，超时后会重试一次 /o
+                _ = WaitForPhaseTimeoutAsync(transferId, ImageTransferPhase.AwaitingAck, 1000);
             }
             catch (OperationCanceledException)
             {
@@ -648,14 +692,21 @@ namespace upper
                 _imagePhase = ImageTransferPhase.Completed;
                 _imageTransferCts?.Cancel();
 
-                // 抑制状态定时器约 120ms，避免打断图片下落动画
-                _suppressStatusUntil = DateTime.Now.AddMilliseconds(120);
+                // 抑制状态定时器约 1000ms，覆盖下位机图片下落动画，避免打断动画
+                _suppressStatusUntil = DateTime.Now.AddMilliseconds(1000);
 
                 pending = _pendingImageData;
                 _pendingImageData = null;
             }
 
-            ImageTransferStatusText.Text = "✅ 图片发送完成";
+            ImageTransferStatusText.Text = "✅ 收到 /a，图片发送完成";
+
+            // 图片到位后立即同步当前播放状态，确保摇臂位置与 PC 一致
+            if (_serialPortService.IsConnected)
+            {
+                bool isPlaying = _currentPlayStatus == "Playing";
+                _serialPortService.SendPlaybackStatus(isPlaying);
+            }
 
             if (pending != null)
             {
@@ -670,8 +721,8 @@ namespace upper
             }
         }
 
-        // 传输阶段超时处理
-        private async Task WaitForPhaseTimeoutAsync(ulong transferId, ImageTransferPhase expectedPhase, int milliseconds)
+        // 传输阶段超时处理（仅用于 AwaitingAck/Completed 等非 Starting 阶段）
+        private async Task WaitForPhaseTimeoutAsync(ulong transferId, ImageTransferPhase expectedPhase, int milliseconds, bool isRetry = false)
         {
             try
             {
@@ -684,11 +735,90 @@ namespace upper
 
             lock (_imageTransferLock)
             {
-                if (_transferId == transferId && _imagePhase == expectedPhase)
+                if (_transferId != transferId || _imagePhase != expectedPhase)
+                    return;
+            }
+
+            // AwaitingAck 超时时，先尝试重发一次 /o（可能是 /o 或 /a 丢失）
+            if (expectedPhase == ImageTransferPhase.AwaitingAck && !isRetry)
+            {
+                ImageTransferStatusText.Text = "/a 超时，重试发送 /o...";
+                _serialPortService.SendImageEndCommand();
+                _ = WaitForPhaseTimeoutAsync(transferId, expectedPhase, milliseconds, isRetry: true);
+                return;
+            }
+
+            byte[]? pending = null;
+
+            lock (_imageTransferLock)
+            {
+                if (_transferId != transferId || _imagePhase != expectedPhase)
+                    return;
+
+                _imagePhase = ImageTransferPhase.Idle;
+                ImageTransferStatusText.Text = $"图片传输超时: {expectedPhase}";
+                pending = _pendingImageData;
+                _pendingImageData = null;
+            }
+
+            // 其他阶段超时时，如果有排队的最新图片，启动新传输
+            if (pending != null)
+            {
+                StartImageTransfer(pending);
+            }
+        }
+
+        // /t 发送后等待 /k：主动重试 /t，若仍未收到 /k 则直接开始发图
+        private async Task WaitForKWithRetryAsync(ulong transferId, CancellationToken ct, int maxRetryCount)
+        {
+            const int RETRY_INTERVAL_MS = 150;
+
+            for (int attempt = 0; attempt < maxRetryCount; attempt++)
+            {
+                try
                 {
-                    _imagePhase = ImageTransferPhase.Idle;
-                    ImageTransferStatusText.Text = $"图片传输超时: {expectedPhase}";
+                    await Task.Delay(RETRY_INTERVAL_MS, ct);
                 }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                lock (_imageTransferLock)
+                {
+                    if (_transferId != transferId || _imagePhase != ImageTransferPhase.Starting)
+                        return;
+                }
+
+                ImageTransferStatusText.Text = $"未收到 /k，第 {attempt + 1} 次重试 /t...";
+                _serialPortService.SendImageStartCommand();
+            }
+
+            // 最后一次重试后再等 200ms，若仍未收到 /k 则直接发图
+            try
+            {
+                await Task.Delay(200, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            byte[]? currentImage = null;
+            lock (_imageTransferLock)
+            {
+                if (_transferId != transferId || _imagePhase != ImageTransferPhase.Starting)
+                    return;
+
+                currentImage = _pendingImageData ?? _imageDataBeingSent;
+                _pendingImageData = null;
+                _imagePhase = ImageTransferPhase.Transferring;
+            }
+
+            if (currentImage != null)
+            {
+                ImageTransferStatusText.Text = "多次重试 /t 仍未收到 /k，直接开始发送图片...";
+                _ = SendImageAsync(transferId, currentImage, CancellationToken.None);
             }
         }
 
@@ -817,14 +947,20 @@ namespace upper
                     return;
             }
 
-            // 根据当前播放状态发送相应命令
+            // 根据当前播放状态发送相应命令，发送失败则触发重连
             if (_currentPlayStatus == "Playing")
             {
-                _serialPortService.SendPlaybackStatus(true);
+                if (!_serialPortService.SendPlaybackStatus(true))
+                {
+                    AutoConnectDevice();
+                }
             }
             else if (_currentPlayStatus == "Paused")
             {
-                _serialPortService.SendPlaybackStatus(false);
+                if (!_serialPortService.SendPlaybackStatus(false))
+                {
+                    AutoConnectDevice();
+                }
             }
         }
 

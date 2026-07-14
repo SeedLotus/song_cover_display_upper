@@ -380,7 +380,10 @@ namespace upper.Services
             if (rgb565Data == null || rgb565Data.Length == 0)
                 return 0;
 
-            return (int)Math.Ceiling(rgb565Data.Length / (double)packetDataSize);
+            // 与下位机固件 PIC_PACK_NUMS (59 * 32 = 1888) 保持一致，避免下位机数组越界
+            const int MAX_PACKET_COUNT = 59 * 32;
+            int count = (int)Math.Ceiling(rgb565Data.Length / (double)packetDataSize);
+            return Math.Min(count, MAX_PACKET_COUNT);
         }
     }
 }

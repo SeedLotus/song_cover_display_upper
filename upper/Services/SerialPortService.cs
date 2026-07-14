@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO.Ports;
 using System.Linq;
+using System.Management;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
@@ -32,6 +33,12 @@ namespace upper.Services
         // 连接状态
         private bool _isConnected = false;
         private string? _connectedPort;
+
+        // WMI 设备插拔监听
+        private ManagementEventWatcher? _deviceRemovedWatcher;
+        private ManagementEventWatcher? _deviceCreatedWatcher;
+        private string _watchVid = "2E3C";
+        private string _watchPid = "2568";
 
         // 公开的事件
         public event EventHandler<bool>? ConnectionStateChanged;
@@ -88,10 +95,28 @@ namespace upper.Services
         }
 
         /// <summary>
-        /// 初始化串口对象
+        /// 初始化串口对象。每次连接前重新创建，避免 USB 断开后句柄残留导致重连异常。
+        /// 调用方需已持有 _serialLock。
         /// </summary>
         private void InitializeSerialPort()
         {
+            if (_serialPort != null)
+            {
+                try
+                {
+                    if (_serialPort.IsOpen)
+                    {
+                        _serialPort.Close();
+                    }
+                }
+                catch { }
+
+                _serialPort.DataReceived -= SerialPort_DataReceived;
+                _serialPort.ErrorReceived -= SerialPort_ErrorReceived;
+                _serialPort.Dispose();
+                _serialPort = null;
+            }
+
             _serialPort = new SerialPort
             {
                 BaudRate = DEFAULT_BAUD_RATE,
@@ -100,7 +125,11 @@ namespace upper.Services
                 StopBits = StopBits.One,
                 Handshake = Handshake.None,
                 ReadBufferSize = READ_BUFFER_SIZE,
-                ReceivedBytesThreshold = 1  // 收到1字节就触发事件
+                ReceivedBytesThreshold = 1,
+                DtrEnable = true,
+                RtsEnable = true,
+                WriteTimeout = 2000,
+                ReadTimeout = 500
             };
 
             _serialPort.DataReceived += SerialPort_DataReceived;
@@ -333,11 +362,8 @@ namespace upper.Services
             {
                 try
                 {
-                    // 如果已经连接，先断开
-                    if (_serialPort.IsOpen)
-                    {
-                        Disconnect();
-                    }
+                    // 先清理旧对象，防止 USB 重连后句柄残留
+                    InitializeSerialPort();
 
                     // 配置串口参数
                     _serialPort.PortName = portName;
@@ -351,6 +377,9 @@ namespace upper.Services
 
                     OnStatusMessage($"已连接到 {portName} (波特率: {baudRate})");
                     UpdateConnectionState(true);
+
+                    // 启动 WMI 插拔监听，确保拔出后能立即检测到断开
+                    StartDeviceWatchers("2E3C", "2568");
 
                     return true;
                 }
@@ -393,7 +422,73 @@ namespace upper.Services
                 finally
                 {
                     UpdateConnectionState(false);
+
+                    // 停止 WMI 监听，避免断开后还收到旧设备事件
+                    StopDeviceWatchers();
                 }
+            }
+        }
+
+        /// <summary>
+        /// 启动 WMI 设备插拔监听
+        /// </summary>
+        public void StartDeviceWatchers(string vid, string pid)
+        {
+            StopDeviceWatchers();
+
+            _watchVid = vid;
+            _watchPid = pid;
+
+            try
+            {
+                // 设备移除监听
+                // WQL LIKE 中反斜杠是转义字符，用 % 通配符匹配 DeviceID 中的反斜杠
+                string removedQuery = $@"SELECT * FROM __InstanceDeletionEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_PnPEntity' AND TargetInstance.DeviceID LIKE 'USB%VID_{vid}%PID_{pid}%'";
+                _deviceRemovedWatcher = new ManagementEventWatcher(removedQuery);
+                _deviceRemovedWatcher.EventArrived += (s, e) =>
+                {
+                    OnStatusMessage($"WMI 检测到设备移除 VID:{vid} PID:{pid}");
+                    Disconnect();
+                };
+                _deviceRemovedWatcher.Start();
+
+                // 设备插入监听
+                string createdQuery = $@"SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_PnPEntity' AND TargetInstance.DeviceID LIKE 'USB%VID_{vid}%PID_{pid}%'";
+                _deviceCreatedWatcher = new ManagementEventWatcher(createdQuery);
+                _deviceCreatedWatcher.EventArrived += (s, e) =>
+                {
+                    OnStatusMessage($"WMI 检测到设备插入 VID:{vid} PID:{pid}");
+                    if (!IsConnected)
+                    {
+                        AutoConnect(vid, pid);
+                    }
+                };
+                _deviceCreatedWatcher.Start();
+            }
+            catch (Exception ex)
+            {
+                OnStatusMessage($"启动 WMI 监听失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 停止 WMI 设备插拔监听
+        /// </summary>
+        public void StopDeviceWatchers()
+        {
+            try
+            {
+                _deviceRemovedWatcher?.Stop();
+                _deviceRemovedWatcher?.Dispose();
+                _deviceRemovedWatcher = null;
+
+                _deviceCreatedWatcher?.Stop();
+                _deviceCreatedWatcher?.Dispose();
+                _deviceCreatedWatcher = null;
+            }
+            catch (Exception ex)
+            {
+                OnStatusMessage($"停止 WMI 监听失败: {ex.Message}");
             }
         }
 
@@ -417,6 +512,7 @@ namespace upper.Services
                 try
                 {
                     _serialPort.Write(data);
+                    _serialPort.BaseStream.Flush();
                     OnStatusMessage($"已发送: {FormatForDisplay(data)}");
                     return true;
                 }
@@ -424,11 +520,8 @@ namespace upper.Services
                 {
                     OnStatusMessage($"发送失败: {ex.Message}");
 
-                    // 发送失败时自动断开
-                    if (ex is System.IO.IOException || ex is InvalidOperationException)
-                    {
-                        Disconnect();
-                    }
+                    // 任何发送失败都视为连接异常，自动断开以便重连
+                    Disconnect();
 
                     return false;
                 }
@@ -453,6 +546,7 @@ namespace upper.Services
                 try
                 {
                     _serialPort.Write(data, 0, data.Length);
+                    _serialPort.BaseStream.Flush();
                     OnStatusMessage($"已发送 {data.Length} 字节数据");
                     return true;
                 }
@@ -460,11 +554,8 @@ namespace upper.Services
                 {
                     OnStatusMessage($"发送失败: {ex.Message}");
 
-                    // 发送失败时自动断开
-                    if (ex is System.IO.IOException || ex is InvalidOperationException)
-                    {
-                        Disconnect();
-                    }
+                    // 任何发送失败都视为连接异常，自动断开以便重连
+                    Disconnect();
 
                     return false;
                 }
@@ -525,12 +616,13 @@ namespace upper.Services
 
                     // 发送数据包
                     _serialPort.Write(packet, 0, PACKET_TOTAL_SIZE);
+                    _serialPort.BaseStream.Flush();
 
                     // 触发事件
                     OnImagePacketSent(new ImagePacketEventArgs
                     {
                         PacketIndex = packetIndex,
-                        TotalPackets = (int)Math.Ceiling(imageData.Length / (double)PACKET_DATA_SIZE),
+                        TotalPackets = CalculatePacketCount(imageData),
                         DataStartIndex = actualDataStartIndex,
                         DataLength = bytesToCopy,
                         Success = true
@@ -627,10 +719,8 @@ namespace upper.Services
             catch (Exception ex)
             {
                 OnStatusMessage($"接收数据出错: {ex.Message}");
-                if (ex is System.IO.IOException || ex is InvalidOperationException)
-                {
-                    Disconnect();
-                }
+                // 任何接收异常都视为连接异常，自动断开以便重连
+                Disconnect();
             }
         }
 
@@ -733,6 +823,14 @@ namespace upper.Services
             };
 
             OnStatusMessage($"串口错误: {errorMessage}");
+
+            // 严重错误时自动断开，让重连逻辑接管
+            if (e.EventType == SerialError.RXOver ||
+                e.EventType == SerialError.Overrun ||
+                e.EventType == SerialError.Frame)
+            {
+                Disconnect();
+            }
         }
 
         // ==================== 辅助方法 ====================
@@ -757,7 +855,11 @@ namespace upper.Services
         public static int CalculatePacketCount(byte[] imageData, int packetDataSize = PACKET_DATA_SIZE)
         {
             if (imageData == null || imageData.Length == 0) return 0;
-            return (int)Math.Ceiling(imageData.Length / (double)packetDataSize);
+
+            // 与下位机固件 PIC_PACK_NUMS (59 * 32 = 1888) 保持一致
+            const int MAX_PACKET_COUNT = 59 * 32;
+            int count = (int)Math.Ceiling(imageData.Length / (double)packetDataSize);
+            return Math.Min(count, MAX_PACKET_COUNT);
         }
 
         // ==================== 事件触发方法 ====================
