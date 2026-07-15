@@ -23,6 +23,8 @@ namespace upper
         public const int WM_SHOW_APP = 0x0400 + 1; // 自定义消息
         private const int HWND_BROADCAST = 0xFFFF;
 
+        private bool _silentStart;
+
         protected override void OnStartup(StartupEventArgs e)
         {
             // 检查是否已有实例运行
@@ -41,9 +43,17 @@ namespace upper
             }
 
             IsSecondInstance = false;
+            _silentStart = e.Args.Contains("--silent", StringComparer.OrdinalIgnoreCase);
 
             // 这是第一个实例，正常启动
             base.OnStartup(e);
+
+            MainWindow = new MainWindow();
+
+            if (!_silentStart)
+            {
+                MainWindow.Show();
+            }
 
             // 启动IPC服务器
             StartIpcServer();

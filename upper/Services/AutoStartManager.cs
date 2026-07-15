@@ -273,6 +273,7 @@ namespace upper.Services
                 $Shortcut = $WshShell.CreateShortcut('{shortcutPath.Replace("'", "''")}')
                 $Shortcut.TargetPath = '{targetPath.Replace("'", "''")}'
                 $Shortcut.WorkingDirectory = '{Path.GetDirectoryName(targetPath).Replace("'", "''")}'
+                $Shortcut.Arguments = '--silent'
                 $Shortcut.Description = '{description.Replace("'", "''")}'
                 $Shortcut.IconLocation = '{targetPath.Replace("'", "''")},0'
                 $Shortcut.Save()

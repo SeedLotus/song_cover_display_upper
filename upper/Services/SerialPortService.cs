@@ -568,8 +568,9 @@ namespace upper.Services
         /// <param name="packetIndex">包序号（从0开始）</param>
         /// <param name="imageData">完整的图片数据</param>
         /// <param name="dataStartIndex">数据起始索引</param>
+        /// <param name="flush">发送后是否立即刷新底层流</param>
         /// <returns>发送是否成功</returns>
-        public bool SendImagePacket(int packetIndex, byte[] imageData, int dataStartIndex = -1)
+        public bool SendImagePacket(int packetIndex, byte[] imageData, int dataStartIndex = -1, bool flush = true)
         {
             if (!_isConnected || _serialPort == null)
             {
@@ -616,7 +617,10 @@ namespace upper.Services
 
                     // 发送数据包
                     _serialPort.Write(packet, 0, PACKET_TOTAL_SIZE);
-                    _serialPort.BaseStream.Flush();
+                    if (flush)
+                    {
+                        _serialPort.BaseStream.Flush();
+                    }
 
                     // 触发事件
                     OnImagePacketSent(new ImagePacketEventArgs
@@ -650,6 +654,43 @@ namespace upper.Services
                     return false;
                 }
             }
+        }
+
+        /// <summary>
+        /// 批量发送一段连续的图片数据包，减少逐包 Flush 开销
+        /// </summary>
+        /// <param name="startIndex">起始包序号（从0开始）</param>
+        /// <param name="count">要发送的包数量</param>
+        /// <param name="imageData">完整的图片数据</param>
+        /// <param name="flushEvery">每隔多少包刷新一次底层流，默认8</param>
+        /// <returns>是否全部发送成功</returns>
+        public bool SendImagePacketRange(int startIndex, int count, byte[] imageData, int flushEvery = 8)
+        {
+            if (!_isConnected || _serialPort == null)
+            {
+                OnStatusMessage("批量发送失败: 串口未连接");
+                return false;
+            }
+
+            if (imageData == null || imageData.Length == 0 || count <= 0)
+            {
+                OnStatusMessage("批量发送失败: 参数无效");
+                return false;
+            }
+
+            int totalPackets = CalculatePacketCount(imageData);
+            int endIndex = Math.Min(startIndex + count, totalPackets);
+
+            for (int i = startIndex; i < endIndex; i++)
+            {
+                bool isFlush = (i - startIndex + 1) % flushEvery == 0 || i == endIndex - 1;
+                if (!SendImagePacket(i, imageData, -1, isFlush))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -721,6 +762,18 @@ namespace upper.Services
                 OnStatusMessage($"接收数据出错: {ex.Message}");
                 // 任何接收异常都视为连接异常，自动断开以便重连
                 Disconnect();
+            }
+        }
+
+        /// <summary>
+        /// 清空接收缓冲区，通常在重连后使用，丢弃旧会话残留数据
+        /// </summary>
+        public void ClearReceiveBuffer()
+        {
+            lock (_bufferLock)
+            {
+                _receiveBuffer.Clear();
+                OnStatusMessage("接收缓冲区已清空");
             }
         }
 
@@ -871,6 +924,7 @@ namespace upper.Services
 
         protected virtual void OnStatusMessage(string message)
         {
+            System.Diagnostics.Debug.WriteLine($"[Serial] {DateTime.Now:HH:mm:ss.fff} {message}");
             StatusMessage?.Invoke(this, message);
         }
 

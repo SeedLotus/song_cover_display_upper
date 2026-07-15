@@ -83,64 +83,65 @@
   - `/a` 超时后自动重试发送一次 `/o`。
   - `HandleImageTransferAck` 收到 `/a` 后立即补发当前播放状态 `/1`/`/0`。
 
-### 2.11 图片下落动画状态抑制
+### 2.12 媒体身份去重（播放/暂停不再重复切封面）
 
-- **问题**：`/a` 后状态定时器 120ms 抑制太短，可能打断下位机图片下落动画。
-- **修复**：抑制时间延长到 1000ms。
+- **问题**：Windows SMTC 在播放/暂停状态变化时也会触发 `MediaPropertiesChanged`，导致同一视频被反复处理、编码、发送。
+- **修复**：在 `MainWindow.OnMediaInfoChanged` 中增加标题/艺术家/专辑身份判断；只有媒体身份真正变化时才进入 `ProcessAlbumArtAsync`，保留 hash 检查作为兜底。
+
+### 2.13 图片处理与传输延迟优化
+
+- **问题**：图片缩放/编码在 UI 线程阻塞，且每包 `Write + Flush` 开销大。
+- **修复**：
+  - `ProcessAlbumArt` 使用 `DispatcherPriority.Background` 调度。
+  - RGB565 编码移到 `Task.Run` 后台线程。
+  - `SerialPortService.SendImagePacket` 增加 `flush` 参数；新增 `SendImagePacketRange` 批量发送，默认每 8 包 Flush 一次。
+  - `SendImageAsync` 改为批量调用，减少底层流刷新次数。
+
+### 2.14 重连后封面同步握手增强
+
+- **问题**：USB 重连后封面仍无法同步，除下位机固件 `pack_get_lost_counter` 未初始化外，上位机 `/t` 发送时机偏早、CDC 初始化尚未完全稳定也是诱因。
+- **修复**：
+  - 重连稳定期从 4 秒延长到 6 秒，唤醒 `/0` 后等待 1.5 秒。
+  - 增加 `SerialPortService.ClearReceiveBuffer()`，在 `/0` 前后各清理一次接收缓冲区。
+  - 增加 `WaitForLineQuietAsync` 线路安静检测，避免在下位机仍有输出时发送 `/t`。
+  - 重连场景 `/t` 重试次数提升到 12 次，间隔 250ms。
+  - `SerialPortService.OnStatusMessage` 增加 `[Serial]` 前缀的 `Debug.WriteLine` 输出，便于在 VS 输出窗口/DebugView 追踪时序。
+
+### 2.15 开机自启动静默启动
+
+- **问题**：开启开机自启动后，系统启动时主窗口会弹出。
+- **修复**：
+  - `App.xaml` 移除 `StartupUri`，设置 `ShutdownMode="OnExplicitShutdown"`。
+  - `App.xaml.cs` 解析 `--silent` 参数，静默启动时只创建 `MainWindow` 不调用 `Show()`。
+  - `AutoStartManager.CreateShortcut` 为快捷方式附加 `--silent` 参数。
+  - 托盘菜单“退出”改为调用 `System.Windows.Application.Current.Shutdown()`。
 
 ---
 
 ## 三、待修复问题
 
-### 3.1 重连后封面仍无法同步（P0）
+### 3.1 重连后封面仍无法同步（P0）—— 观察中
 
-- **现象**：重新插拔 USB 后，上位机显示已连接、封面正确，但下位机不显示封面；摇臂功能正常。
-- **观察**：
-  - `/0`、`/1` 等状态命令能正常到达下位机（摇臂可控）。
-  - `/t` 及后续图片包可能未被下位机正确处理。
-- **可能根因**：
-  1. 下位机 CDC 初始化完成后，`/t` 发送时机仍偏早，首次 `/t` 被丢弃。
-  2. 下位机收到 `/t` 后发送 `/k` 时 `g_tx_completed` 为 false，`/k` 被静默丢弃，但 `flag_in_rx_pic` 已置 1；后续图片包若到达可正常处理，但若主机因未收到 `/k` 而状态机异常，可能导致流程中断。
-  3. 图片包传输过程中丢包，下位机发送 `/r`/`/x` 请求重传，但主机未收到或重传逻辑未完全对齐。
-  4. 下位机固件 `pack_get_lost_counter` 中 `uint8_t i` 未初始化，导致丢包统计错误，可能提前发送 `/a` 或误报大量丢包。
+- **当前状态**：上位机侧已完成延迟、缓冲区清理、线路安静检测、诊断日志、批量发送等兼容性增强；若仍无法同步，核心根因将指向下位机固件 `pack_get_lost_counter` 未初始化问题，需配合下位机固件仓库修复。
 - **建议下一步**：
-  - 在下位机固件中修复 `pack_get_lost_counter` 的 `i` 初始化。
-  - 上位机增加更细粒度的诊断：记录每次 `/t`、`/k`、包发送进度、`/o`、`/a`、`/r`、`/x` 的时间戳与状态。
-  - 考虑在下位机侧增加一个“ping/echo”测试命令，用于验证重连后主机到下位机的双向通路。
+  - 使用本轮新增的 `[Serial]` 调试日志，确认 `/t` 重试次数、`/k` 是否到达、`/a` 与 `/r`/`/x` 的时序。
+  - 推动下位机固件修复 `pack_get_lost_counter` 中 `uint8_t i` 的初始化。
 
-### 3.2 播放/暂停时封面重复切换（P1）
+### 3.2 播放/暂停时封面重复切换（P1）—— 已修复
 
-- **现象**：视频播放时会切一次封面，暂停时又会用当前封面再切一次。
-- **可能根因**：`MediaService` 在播放状态变化时可能重新触发 `MediaPropertiesChanged`，导致 `ProcessAlbumArtAsync` 被重复调用；或者同一视频的不同状态触发了不同的 SMTC 会话/属性更新。
-- **建议下一步**：
-  - 在 `ProcessAlbumArtAsync` 中增加更严格的去重逻辑（不仅比较图片哈希，还要比较标题/艺术家组合）。
-  - 检查 `OnPlaybackStateChanged` 是否会间接触发封面重新处理。
-  - 增加日志记录每次进入 `ProcessAlbumArtAsync` 的调用来源。
+- **修复方式**：在 `MainWindow.OnMediaInfoChanged` 中增加标题/艺术家/专辑身份判断；同一媒体播放/暂停状态变化但身份未变时，跳过 `ProcessAlbumArtAsync`。
+- **验证方向**：播放视频后暂停/播放，观察 `ImageTransferStatusText` 不应再出现“准备传输图片”等封面处理文本。
 
-### 3.3 切换视频封面延迟仍可优化（P2）
+### 3.3 切换视频封面延迟仍可优化（P2）—— 已部分优化
 
-- **现象**：切换视频后封面更换仍有约 1 秒延迟。
-- **已尝试**：缩短 `/k` 重试间隔到 150ms，`/a` 超时到 1000ms。
-- **仍可优化方向**：
-  - 图片传输阶段：目前每包 `Write + Flush`，可改为每 N 包刷新一次，或依赖 USB NAK 流控并加入精确 pacing。
-  - 封面处理：异步化图片缩放/编码，避免阻塞 UI 线程。
-  - `/a` 等待：若下位机固件能快速确认，可进一步缩短。
+- **当前状态**：图片处理已使用 `DispatcherPriority.Background` 调度，RGB565 编码已移到后台 `Task.Run`，串口发送已改为批量 Flush（每 8 包刷新一次）。
+- **可继续微调**：根据实机测试调整 `BATCH_SIZE` 与 `flushEvery`，在延迟与 USB CDC 缓冲安全之间取得平衡。
 
 ---
 
 ## 四、未来新需求
 
-### 4.1 开机自启动后静默启动
-
-- **需求**：开启“开机自启动”后，程序启动时直接最小化到系统托盘，不显示主窗口。
-- **涉及文件**：
-  - `MainWindow.xaml.cs`：在 `MainWindow()` 或 `Window_Loaded` 中检测启动参数或配置，调用 `HideWindowToTray()`。
-  - `AutoStartManager.cs`：注册启动项时传递 `--minimized` 或 `--tray` 参数。
-  - `App.xaml.cs`：解析启动参数，决定窗口初始状态。
-- **注意事项**：
-  - 需要避免与单实例检测（`App.IsSecondInstance`）冲突。
-  - 静默启动时仍需初始化媒体服务、串口服务、自动重连等后台逻辑。
-  - 建议增加用户可配置项：是否开机静默启动。
+- 暂无新的未来需求；当前“开机自启动静默启动”已实现（启动参数 `--silent`）。
 
 ---
 
@@ -156,6 +157,7 @@
 | 2026-07-15 | PC 播放/暂停控制摇臂 | 通过 | 立即下发 `/1`/`/0` 后响应较快 |
 | 2026-07-15 | 重连后封面同步 | 未通过 | 多次调整 `/0` 延迟、`/t` 重试、`/o` 重试仍未解决 |
 | 2026-07-15 | 播放/暂停重复切封面 | 未修复 | 待后续分析 `MediaService` 事件触发来源 |
+| 2026-07-15 | 本轮迭代实现 | 待验证 | P1/P2/静默启动已实现；P0 增强诊断与延迟，等待实机测试 |
 
 ---
 
