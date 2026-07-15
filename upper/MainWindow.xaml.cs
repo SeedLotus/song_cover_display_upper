@@ -53,7 +53,16 @@ namespace upper
         private ulong _transferId = 0;                // 传输代 ID，递增
         private readonly object _imageTransferLock = new();
         private CancellationTokenSource? _imageTransferCts;
-        private DateTime _suppressStatusUntil = DateTime.MinValue; // 抑制 /1 发送的时间点
+        private DateTime _suppressStatusUntil = DateTime.MinValue; // 抑制状态 topic 发送的时间点
+
+        // 下位机唱臂状态跟踪：下位机把 /1 和 /0 都当作"切换状态"的 topic，
+        // 因此上位机必须自己维护下位机 believed state，只在需要切换时发送 topic。
+        private bool _lowerMachinePlaying = false;
+
+        private bool _autoRetryOnAckTimeout = false;  // 重连后首次封面同步 /a 超时是否自动重试一次
+
+        // 专辑封面处理串行锁：防止 SMTC 快速重复事件导致同一封面被并发处理两次
+        private readonly SemaphoreSlim _processAlbumArtLock = new SemaphoreSlim(1, 1);
 
         // 重连后封面同步的可配置参数
         private static readonly TimeSpan PostConnectSettleDelay = TimeSpan.FromSeconds(6);
@@ -252,25 +261,27 @@ namespace upper
                     return;
                 }
 
-                _lastMediaTitle = e.Title;
-                _lastMediaArtist = e.Artist;
-                _lastMediaAlbum = e.Album;
+                // 注意：_lastMediaTitle/_lastImageHash 不在此处更新，
+                // 而是放到 ProcessAlbumArtAsync 中，在确认缩略图 hash 真正变化后再更新。
+                // 这样可以避免 SMTC 缩略图滞后（标题已变但缩略图还是旧图）导致的错位。
+                var title = e.Title;
+                var artist = e.Artist;
+                var album = e.Album;
 
                 // 图片处理涉及大量 DispatcherObject，统一放到 UI 线程执行
-                await Dispatcher.InvokeAsync(async () => await ProcessAlbumArtAsync(thumbnailRef));
+                await Dispatcher.InvokeAsync(async () => await ProcessAlbumArtAsync(thumbnailRef, title, artist, album));
             }
             else
             {
-                _lastMediaTitle = e.Title;
-                _lastMediaArtist = e.Artist;
-                _lastMediaAlbum = e.Album;
-
+                // 无缩略图时（例如切换中的临时状态），不更新 _lastMediaTitle/_lastImageHash，
+                // 避免后续真正带缩略图的事件因 identityChanged=false 被跳过，
+                // 也避免清空 hash 后把滞后的旧缩略图误判为新图。
                 await Dispatcher.InvokeAsync(() =>
                 {
                     // 显示默认占位图
                     AlbumArtImage.Source = ImageProcessor.CreatePlaceholderImage();
-                    _currentImageRgb565Data = null;
-                    _lastImageHash = null;
+                    // 注意：不在这里清空 _currentImageRgb565Data/_lastImageHash，
+                    // 否则下位机会继续显示上一张封面；如需发送占位图应单独处理。
                 });
             }
         }
@@ -289,11 +300,9 @@ namespace upper
                 SysPlayButton.IsEnabled = !isPlaying;
                 SysPauseButton.IsEnabled = isPlaying;
 
-                // 播放状态变化时立即通知下位机，而不是等 1 秒定时器
-                if (_serialPortService.IsConnected)
-                {
-                    _serialPortService.SendPlaybackStatus(isPlaying);
-                }
+                // PC 播放状态变化时，与下位机 believed state 对比，只在需要切换时发送 topic。
+                // 下位机把 /1 和 /0 都当作切换命令，重复发送会导致摇臂反向运动。
+                SyncPlaybackStatusToLowerMachine();
             });
         }
 
@@ -332,12 +341,31 @@ namespace upper
             };
         }
 
+        // 根据 PC 当前播放状态与下位机 believed state 的对比，决定是否需要发送 topic 切换。
+        // 下位机收到 /1 或 /0 都会切换状态，因此必须避免重复发送。
+        private void SyncPlaybackStatusToLowerMachine()
+        {
+            if (!_serialPortService.IsConnected) return;
+
+            bool pcPlaying = _currentPlayStatus == "Playing";
+            if (pcPlaying == _lowerMachinePlaying) return;
+
+            // 发送 /1 或 /0 效果相同：都是让下位机切换状态的 topic
+            if (_serialPortService.SendPlaybackStatus(pcPlaying))
+            {
+                _lowerMachinePlaying = pcPlaying;
+            }
+        }
+
         // ==================== 图片处理逻辑 ====================
 
         // 处理并显示专辑封面
         private async Task ProcessAlbumArtAsync(
-            Windows.Storage.Streams.IRandomAccessStreamReference thumbnailRef)
+            Windows.Storage.Streams.IRandomAccessStreamReference thumbnailRef,
+            string title, string artist, string album)
         {
+            // 串行化封面处理，避免 SMTC 快速重复事件并发进入导致同一封面被发送两次
+            await _processAlbumArtLock.WaitAsync();
             try
             {
                 // 加载原始图像
@@ -350,13 +378,30 @@ namespace upper
                     originalBitmap.EndInit();
                     originalBitmap.Freeze();
 
+                    // 同一媒体身份且已经处理过封面，直接跳过。
+                    // 这能防止 SMTC 缩略图滞后（标题已更新但缩略图还是旧图，或反之）
+                    // 导致的旧图覆盖新图。
+                    bool sameIdentity = title == _lastMediaTitle
+                                     && artist == _lastMediaArtist
+                                     && album == _lastMediaAlbum;
+                    if (sameIdentity && _currentImageRgb565Data != null)
+                    {
+                        return;
+                    }
+
                     // 检测图片是否变化
                     string newHash = ImageProcessor.ComputeImageHash(originalBitmap);
                     if (newHash == _lastImageHash)
                     {
-                        // 图片未变化，直接返回
+                        // 图片 hash 未变化，说明是同一封面，直接返回。
                         return;
                     }
+
+                    // 真正的新封面：立即更新媒体身份与 hash，这样后续重复/滞后事件能正确判断。
+                    _lastMediaTitle = title;
+                    _lastMediaArtist = artist;
+                    _lastMediaAlbum = album;
+                    _lastImageHash = newHash;
 
                     // 处理图片（智能缩放 + 模糊背景），使用后台优先级减少 UI 卡顿
                     var processedImage = await Dispatcher.InvokeAsync(
@@ -371,14 +416,13 @@ namespace upper
                     });
 
                     // 编码为RGB565（用于发送到下位机），移到后台线程避免阻塞 UI
-                    _currentImageRgb565Data = await Task.Run(() =>
+                    var rgb565Data = await Task.Run(() =>
                     {
                         if (processedImage == null) return null;
                         return ImageProcessor.ConvertToRgb565(processedImage);
                     });
-                    _lastImageHash = newHash;
 
-                    if (_currentImageRgb565Data == null)
+                    if (rgb565Data == null)
                     {
                         await Dispatcher.InvokeAsync(() =>
                         {
@@ -387,16 +431,29 @@ namespace upper
                         return;
                     }
 
+                    // 关键：异步处理期间用户可能已切换到其他视频，校验身份是否仍匹配。
+                    // 若已切换，则丢弃本次结果，避免发送过时的封面。
+                    if (title != _lastMediaTitle || artist != _lastMediaArtist || album != _lastMediaAlbum)
+                    {
+                        await Dispatcher.InvokeAsync(() =>
+                        {
+                            ImageTransferStatusText.Text = "封面已过期，跳过发送";
+                        });
+                        return;
+                    }
+
+                    _currentImageRgb565Data = rgb565Data;
+
                     // 更新状态显示
                     await Dispatcher.InvokeAsync(() =>
                     {
-                        int totalPackets = ImageProcessor.CalculatePacketCount(_currentImageRgb565Data);
+                        int totalPackets = ImageProcessor.CalculatePacketCount(rgb565Data);
                         ImageTransferStatusText.Text =
-                            $"✅ 封面图片就绪 ({_currentImageRgb565Data.Length} 字节, {totalPackets} 包)";
+                            $"✅ 封面图片就绪 ({rgb565Data.Length} 字节, {totalPackets} 包)";
                     });
 
                     // 启动图片传输状态机
-                    StartImageTransfer(_currentImageRgb565Data);
+                    StartImageTransfer(rgb565Data);
                 }
             }
             catch (Exception ex)
@@ -408,6 +465,10 @@ namespace upper
                     _lastImageHash = null;
                     ImageTransferStatusText.Text = $"封面处理失败: {ex.Message}";
                 });
+            }
+            finally
+            {
+                _processAlbumArtLock.Release();
             }
         }
 
@@ -527,7 +588,20 @@ namespace upper
                         // 先发送 /0 唤醒并稳定下位机状态，等待唱臂状态机完成过渡
                         ImageTransferStatusText.Text = "发送 /0 唤醒下位机，等待稳定...";
                         _serialPortService.SendPlaybackStatus(false);
+                        _lowerMachinePlaying = false; // /0 将下位机复位到暂停态
                         await Task.Delay(WakeCommandDelay);
+
+                        if (!_serialPortService.IsConnected)
+                        {
+                            ImageTransferStatusText.Text = "同步前连接已断开，取消本次同步";
+                            return;
+                        }
+
+                        // /0 会让摇臂进入暂停态；若 PC 正在播放，立即补发 /1 让摇臂到位，
+                        // 避免封面同步完成前摇臂长时间放下。
+                        ImageTransferStatusText.Text = "同步摇臂位置到当前播放状态...";
+                        SyncPlaybackStatusToLowerMachine();
+                        await Task.Delay(300);
 
                         if (!_serialPortService.IsConnected)
                         {
@@ -547,6 +621,7 @@ namespace upper
                         }
 
                         ImageTransferStatusText.Text = "开始同步封面到重连后的设备...";
+                        _autoRetryOnAckTimeout = true;
                         StartImageTransfer(_currentImageRgb565Data, kRetryCount: ReconnectKRetryCount, kRetryIntervalMs: ReconnectKRetryIntervalMs);
                     }
                 }
@@ -582,15 +657,31 @@ namespace upper
                 case "/q1":
                     // 下位机请求播放命令
                     ImageTransferStatusText.Text = "收到 /q1，请求播放";
-                    _serialPortService.SendPlaybackStatus(true);
-                    _ = _mediaService.TryPlayAsync();
+                    _lowerMachinePlaying = false; // 下位机当前认为自己在暂停态
+                    if (_currentPlayStatus == "Playing")
+                    {
+                        // PC 已经在播放，直接同步一次 topic 让下位机切换
+                        SyncPlaybackStatusToLowerMachine();
+                    }
+                    else
+                    {
+                        // 请求 PC 播放，待 SMTC 事件触发后由 OnPlaybackStateChanged 发送 topic
+                        _ = _mediaService.TryPlayAsync();
+                    }
                     break;
 
                 case "/q0":
                     // 下位机请求暂停命令
                     ImageTransferStatusText.Text = "收到 /q0，请求暂停";
-                    _serialPortService.SendPlaybackStatus(false);
-                    _ = _mediaService.TryPauseAsync();
+                    _lowerMachinePlaying = true; // 下位机当前认为自己在播放态
+                    if (_currentPlayStatus == "Paused")
+                    {
+                        SyncPlaybackStatusToLowerMachine();
+                    }
+                    else
+                    {
+                        _ = _mediaService.TryPauseAsync();
+                    }
                     break;
 
                 case "/k":
@@ -627,22 +718,36 @@ namespace upper
 
             lock (_imageTransferLock)
             {
-                // 如果当前正在传输，先排队为 pending 并请求取消当前传输，
+                // 如果当前还在等 /k（Starting），下位机尚未开始收图包，
+                // 可以直接替换为新图，避免快速切换时 pending 丢失或状态卡住。
+                if (_imagePhase == ImageTransferPhase.Starting)
+                {
+                    _imageTransferCts?.Cancel();
+                    _transferId++;
+                    currentTransferId = _transferId;
+                    _imageDataBeingSent = imageData;
+                    _pendingImageData = null;
+                    _imageTransferCts = new CancellationTokenSource();
+                    // _imagePhase 保持 Starting
+                }
+                // 如果正在传输中或等待 /a，先排队为 pending 并请求取消当前传输，
                 // 等当前传输自然结束（收到 /a 或超时）后再启动新传输，
                 // 避免向下位机发送重叠的 /t 命令。
-                if (_imagePhase != ImageTransferPhase.Idle)
+                else if (_imagePhase != ImageTransferPhase.Idle)
                 {
                     _pendingImageData = imageData;
                     _imageTransferCts?.Cancel();
                     return;
                 }
-
-                _transferId++;
-                currentTransferId = _transferId;
-                _imageDataBeingSent = imageData;
-                _pendingImageData = null;
-                _imagePhase = ImageTransferPhase.Starting;
-                _imageTransferCts = new CancellationTokenSource();
+                else
+                {
+                    _transferId++;
+                    currentTransferId = _transferId;
+                    _imageDataBeingSent = imageData;
+                    _pendingImageData = null;
+                    _imagePhase = ImageTransferPhase.Starting;
+                    _imageTransferCts = new CancellationTokenSource();
+                }
             }
 
             if (!_serialPortService.IsConnected)
@@ -737,7 +842,7 @@ namespace upper
 
                 _serialPortService.SendImageEndCommand();
 
-                // 1000ms 内未收到 /a 则超时，超时后会重试一次 /o
+                // 1000ms 内未收到 /a 则超时；不再重试 /o，避免下位机重复播放下落动画。
                 _ = WaitForPhaseTimeoutAsync(transferId, ImageTransferPhase.AwaitingAck, 1000);
             }
             catch (OperationCanceledException)
@@ -775,20 +880,22 @@ namespace upper
 
                 pending = _pendingImageData;
                 _pendingImageData = null;
+                _autoRetryOnAckTimeout = false;
             }
 
             ImageTransferStatusText.Text = "✅ 收到 /a，图片发送完成";
 
-            // 图片到位后立即同步当前播放状态，确保摇臂位置与 PC 一致
-            if (_serialPortService.IsConnected)
-            {
-                bool isPlaying = _currentPlayStatus == "Playing";
-                _serialPortService.SendPlaybackStatus(isPlaying);
-            }
+            // 图片到位后同步当前播放状态，确保摇臂位置与 PC 一致，
+            // 但只在 PC 状态与下位机 believed state 不一致时才发送 topic，避免误切换。
+            SyncPlaybackStatusToLowerMachine();
 
             if (pending != null)
             {
-                StartImageTransfer(pending);
+                // 稍等片刻再启动下一张图，让下位机完成图片下落动画和状态机过渡
+                _ = Task.Delay(200).ContinueWith(_ =>
+                {
+                    Dispatcher.Invoke(() => StartImageTransfer(pending));
+                });
             }
             else
             {
@@ -799,8 +906,8 @@ namespace upper
             }
         }
 
-        // 传输阶段超时处理（仅用于 AwaitingAck/Completed 等非 Starting 阶段）
-        private async Task WaitForPhaseTimeoutAsync(ulong transferId, ImageTransferPhase expectedPhase, int milliseconds, bool isRetry = false)
+        // 传输阶段超时处理
+        private async Task WaitForPhaseTimeoutAsync(ulong transferId, ImageTransferPhase expectedPhase, int milliseconds)
         {
             try
             {
@@ -817,16 +924,13 @@ namespace upper
                     return;
             }
 
-            // AwaitingAck 超时时，先尝试重发一次 /o（可能是 /o 或 /a 丢失）
-            if (expectedPhase == ImageTransferPhase.AwaitingAck && !isRetry)
-            {
-                ImageTransferStatusText.Text = "/a 超时，重试发送 /o...";
-                _serialPortService.SendImageEndCommand();
-                _ = WaitForPhaseTimeoutAsync(transferId, expectedPhase, milliseconds, isRetry: true);
-                return;
-            }
+            // 注意：不再重试 /o。下位机每次收到 /o 都会播放一次下落动画，
+            // 重试 /o 会导致同一封面被播放两次。若 /a 超时，依赖后续切换视频重新传输，
+            // 或重连后的 autoRetry 机制。
 
             byte[]? pending = null;
+            bool autoRetry = false;
+            byte[]? currentImage = null;
 
             lock (_imageTransferLock)
             {
@@ -837,12 +941,27 @@ namespace upper
                 ImageTransferStatusText.Text = $"图片传输超时: {expectedPhase}";
                 pending = _pendingImageData;
                 _pendingImageData = null;
+                autoRetry = _autoRetryOnAckTimeout;
+                _autoRetryOnAckTimeout = false;
+                currentImage = _currentImageRgb565Data;
             }
 
-            // 其他阶段超时时，如果有排队的最新图片，启动新传输
-            if (pending != null)
+            // 重连后首次封面同步 /a 超时，自动重试一次完整传输
+            if (autoRetry && currentImage != null)
             {
-                StartImageTransfer(pending);
+                ImageTransferStatusText.Text = "重连后首次同步未收到 /a，自动重试一次...";
+                _ = Task.Delay(500).ContinueWith(_ =>
+                {
+                    Dispatcher.Invoke(() => StartImageTransfer(currentImage, kRetryCount: ReconnectKRetryCount, kRetryIntervalMs: ReconnectKRetryIntervalMs));
+                });
+            }
+            // 其他阶段超时时，如果有排队的最新图片，启动新传输
+            else if (pending != null)
+            {
+                _ = Task.Delay(200).ContinueWith(_ =>
+                {
+                    Dispatcher.Invoke(() => StartImageTransfer(pending));
+                });
             }
         }
 
@@ -1031,31 +1150,19 @@ namespace upper
         {
             if (!_serialPortService.IsConnected) return;
 
-            // 图片下落动画期间抑制状态命令，避免打断动画
+            // 图片下落动画期间抑制状态 topic，避免打断动画
             if (DateTime.Now < _suppressStatusUntil) return;
 
-            // 图片传输过程中暂停发送状态命令
+            // 图片传输过程中暂停发送状态 topic
             lock (_imageTransferLock)
             {
                 if (_imagePhase != ImageTransferPhase.Idle && _imagePhase != ImageTransferPhase.Completed)
                     return;
             }
 
-            // 根据当前播放状态发送相应命令，发送失败则触发重连
-            if (_currentPlayStatus == "Playing")
-            {
-                if (!_serialPortService.SendPlaybackStatus(true))
-                {
-                    AutoConnectDevice();
-                }
-            }
-            else if (_currentPlayStatus == "Paused")
-            {
-                if (!_serialPortService.SendPlaybackStatus(false))
-                {
-                    AutoConnectDevice();
-                }
-            }
+            // 与下位机 believed state 对比，只在不一致时补发 topic，
+            // 避免下位机把周期心跳当成切换指令。
+            SyncPlaybackStatusToLowerMachine();
         }
 
         // 自动重连定时器事件
