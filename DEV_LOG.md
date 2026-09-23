@@ -4,6 +4,12 @@
 > 维护者：Claude Code / WorkBuddy  
 > 最后更新：2026-09-24
 
+> **固件侧进展（2026-09-24 凌晨）**：固件仓库已 fork 至 SeedLotus/song_cover_display 并注册为兄弟子项目 `projects/song-cover-display`。
+> 固件修复 `7328afd`（3.4/3.5 根因 + `/h` 心跳 + 越界写修复）与 GCC 构建体系 `6f70fb2`（Makefile + 224K 链接脚本）已提交推送，
+> 本机已用 MSYS2 arm-none-eabi-gcc 13.3 编出 `build/firmware.hex`。**尚未烧录**——用户无调试器，
+> 待确认 PCB 是否有 BOOT0 焊盘（有则 USB DFU，无则购 DAPLink 后用 pyocd 烧录）。
+> 烧录后需验证：重连首封面（3.5）、60 秒不休眠（3.6）、无 AwaitingAck 超时提示（3.4）。
+
 ---
 
 ## 一、项目背景
