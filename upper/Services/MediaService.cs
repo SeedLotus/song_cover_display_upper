@@ -246,9 +246,9 @@ namespace upper.Services
         }
 
         /// <summary>
-        /// 更新播放状态并触发事件
+        /// 更新播放状态并触发事件（GetPlaybackInfo 为同步 API，方法本身无异步操作）
         /// </summary>
-        private async Task UpdatePlaybackInfoAsync()
+        private Task UpdatePlaybackInfoAsync()
         {
             GlobalSystemMediaTransportControlsSession? currentSession;
 
@@ -257,7 +257,7 @@ namespace upper.Services
                 currentSession = _currentSession;
             }
 
-            if (currentSession == null) return;
+            if (currentSession == null) return Task.CompletedTask;
 
             try
             {
@@ -271,6 +271,43 @@ namespace upper.Services
                 System.Diagnostics.Debug.WriteLine($"获取播放状态失败: {ex.Message}");
                 // 如果获取失败，可能是会话已无效
                 OnPlaybackStateChanged("NoSession");
+            }
+
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// 主动拉取当前会话的最新媒体信息。
+        /// SMTC 的 MediaPropertiesChanged 事件触发时，属性可能尚未更新（读到上一个媒体的数据），
+        /// 上层应在防抖后调用本方法获取可信的最新数据。
+        /// </summary>
+        public async Task<MediaInfoChangedEventArgs?> GetCurrentMediaInfoAsync()
+        {
+            GlobalSystemMediaTransportControlsSession? currentSession;
+
+            lock (_sessionLock)
+            {
+                currentSession = _currentSession;
+            }
+
+            if (currentSession == null) return null;
+
+            try
+            {
+                var mediaProperties = await currentSession.TryGetMediaPropertiesAsync();
+
+                return new MediaInfoChangedEventArgs
+                {
+                    Title = mediaProperties.Title ?? "未知标题",
+                    Artist = mediaProperties.Artist ?? "未知艺术家",
+                    Album = mediaProperties.AlbumTitle ?? "未知专辑",
+                    ThumbnailStream = mediaProperties.Thumbnail
+                };
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"主动拉取媒体信息失败: {ex.Message}");
+                return null;
             }
         }
 

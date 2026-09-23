@@ -586,78 +586,85 @@ namespace upper.Services
 
             lock (_serialLock)
             {
-                try
-                {
-                    // 计算数据起始位置
-                    int actualDataStartIndex = dataStartIndex >= 0
-                        ? dataStartIndex
-                        : packetIndex * PACKET_DATA_SIZE;
-
-                    // 计算要发送的数据长度
-                    int bytesToCopy = Math.Min(PACKET_DATA_SIZE, imageData.Length - actualDataStartIndex);
-
-                    if (bytesToCopy <= 0)
-                    {
-                        OnStatusMessage($"发送失败: 数据索引越界 (包{packetIndex}, 起始{actualDataStartIndex})");
-                        return false;
-                    }
-
-                    // 构建数据包
-                    byte[] packet = new byte[PACKET_TOTAL_SIZE];
-
-                    // 包头：'#' (0x23)
-                    packet[0] = (byte)'#';
-
-                    // 包序号（大端序：高字节在前，低字节在后）
-                    packet[1] = (byte)((packetIndex >> 8) & 0xFF);  // 高字节
-                    packet[2] = (byte)(packetIndex & 0xFF);         // 低字节
-
-                    // 复制图片数据
-                    Array.Copy(imageData, actualDataStartIndex, packet, 3, bytesToCopy);
-
-                    // 发送数据包
-                    _serialPort.Write(packet, 0, PACKET_TOTAL_SIZE);
-                    if (flush)
-                    {
-                        _serialPort.BaseStream.Flush();
-                    }
-
-                    // 触发事件
-                    OnImagePacketSent(new ImagePacketEventArgs
-                    {
-                        PacketIndex = packetIndex,
-                        TotalPackets = CalculatePacketCount(imageData),
-                        DataStartIndex = actualDataStartIndex,
-                        DataLength = bytesToCopy,
-                        Success = true
-                    });
-
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    OnImagePacketSent(new ImagePacketEventArgs
-                    {
-                        PacketIndex = packetIndex,
-                        Success = false,
-                        ErrorMessage = ex.Message
-                    });
-
-                    OnStatusMessage($"发送包 {packetIndex} 失败: {ex.Message}");
-
-                    // 发送失败时自动断开
-                    if (ex is System.IO.IOException || ex is InvalidOperationException)
-                    {
-                        Disconnect();
-                    }
-
-                    return false;
-                }
+                return SendImagePacketCore(packetIndex, imageData, dataStartIndex, flush);
             }
         }
 
         /// <summary>
-        /// 批量发送一段连续的图片数据包，减少逐包 Flush 开销
+        /// 发送单个图片数据包的内部实现。调用方必须已持有 _serialLock。
+        /// </summary>
+        private bool SendImagePacketCore(int packetIndex, byte[] imageData, int dataStartIndex, bool flush)
+        {
+            try
+            {
+                // 计算数据起始位置
+                int actualDataStartIndex = dataStartIndex >= 0
+                    ? dataStartIndex
+                    : packetIndex * PACKET_DATA_SIZE;
+
+                // 计算要发送的数据长度
+                int bytesToCopy = Math.Min(PACKET_DATA_SIZE, imageData.Length - actualDataStartIndex);
+
+                if (bytesToCopy <= 0)
+                {
+                    OnStatusMessage($"发送失败: 数据索引越界 (包{packetIndex}, 起始{actualDataStartIndex})");
+                    return false;
+                }
+
+                // 构建数据包
+                byte[] packet = new byte[PACKET_TOTAL_SIZE];
+
+                // 包头：'#' (0x23)
+                packet[0] = (byte)'#';
+
+                // 包序号（大端序：高字节在前，低字节在后）
+                packet[1] = (byte)((packetIndex >> 8) & 0xFF);  // 高字节
+                packet[2] = (byte)(packetIndex & 0xFF);         // 低字节
+
+                // 复制图片数据
+                Array.Copy(imageData, actualDataStartIndex, packet, 3, bytesToCopy);
+
+                // 发送数据包
+                _serialPort!.Write(packet, 0, PACKET_TOTAL_SIZE);
+                if (flush)
+                {
+                    _serialPort.BaseStream.Flush();
+                }
+
+                // 触发事件
+                OnImagePacketSent(new ImagePacketEventArgs
+                {
+                    PacketIndex = packetIndex,
+                    TotalPackets = CalculatePacketCount(imageData),
+                    DataStartIndex = actualDataStartIndex,
+                    DataLength = bytesToCopy,
+                    Success = true
+                });
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                OnImagePacketSent(new ImagePacketEventArgs
+                {
+                    PacketIndex = packetIndex,
+                    Success = false,
+                    ErrorMessage = ex.Message
+                });
+
+                OnStatusMessage($"发送包 {packetIndex} 失败: {ex.Message}");
+
+                // 与 SendString/SendBytes 策略对齐：任何发送失败都视为连接异常，自动断开以便重连。
+                // lock 是可重入的，此处 Disconnect 不会死锁。
+                Disconnect();
+
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 批量发送一段连续的图片数据包，减少逐包 Flush 开销。
+        /// 整批在单次 _serialLock 内完成，避免批与批之间被心跳/其他命令插入而打乱包序。
         /// </summary>
         /// <param name="startIndex">起始包序号（从0开始）</param>
         /// <param name="count">要发送的包数量</param>
@@ -681,12 +688,15 @@ namespace upper.Services
             int totalPackets = CalculatePacketCount(imageData);
             int endIndex = Math.Min(startIndex + count, totalPackets);
 
-            for (int i = startIndex; i < endIndex; i++)
+            lock (_serialLock)
             {
-                bool isFlush = (i - startIndex + 1) % flushEvery == 0 || i == endIndex - 1;
-                if (!SendImagePacket(i, imageData, -1, isFlush))
+                for (int i = startIndex; i < endIndex; i++)
                 {
-                    return false;
+                    bool isFlush = (i - startIndex + 1) % flushEvery == 0 || i == endIndex - 1;
+                    if (!SendImagePacketCore(i, imageData, -1, isFlush))
+                    {
+                        return false;
+                    }
                 }
             }
 

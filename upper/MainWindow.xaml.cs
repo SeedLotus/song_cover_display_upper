@@ -34,8 +34,8 @@ namespace upper
         private string _lastMediaArtist = string.Empty;  // 上次媒体艺术家
         private string _lastMediaAlbum = string.Empty;   // 上次媒体专辑
         private bool _isExitingFromTrayMenu = false;  // 是否从托盘菜单退出
-        private DispatcherTimer _statusSendTimer;     // 定时发送播放状态到串口
-        private DispatcherTimer _autoReconnectTimer;  // 自动重连定时器
+        private DispatcherTimer _statusSendTimer = null!;     // 定时发送播放状态到串口（InitializeTimers 中赋值）
+        private DispatcherTimer _autoReconnectTimer = null!;  // 自动重连定时器（InitializeTimers 中赋值）
 
         // 图片传输状态机
         private enum ImageTransferPhase
@@ -60,9 +60,16 @@ namespace upper
         private bool _lowerMachinePlaying = false;
 
         private bool _autoRetryOnAckTimeout = false;  // 重连后首次封面同步 /a 超时是否自动重试一次
+        private DateTime _transferStartTime;           // 本次传输开始时间（用于耗时日志）
 
         // 专辑封面处理串行锁：防止 SMTC 快速重复事件导致同一封面被并发处理两次
         private readonly SemaphoreSlim _processAlbumArtLock = new SemaphoreSlim(1, 1);
+
+        // 媒体事件防抖：SMTC 事件触发瞬间属性可能仍是上一个媒体的，需延迟后主动重取
+        private CancellationTokenSource? _mediaDebounceCts;
+        // 两段式拉取：120ms 首次拉取（尽快出图），500ms 确认拉取（兜住 SMTC 滞后更新）
+        private static readonly TimeSpan MediaFirstFetchDelay = TimeSpan.FromMilliseconds(120);
+        private static readonly TimeSpan MediaConfirmFetchDelay = TimeSpan.FromMilliseconds(500);
 
         // 重连后封面同步的可配置参数
         private static readonly TimeSpan PostConnectSettleDelay = TimeSpan.FromSeconds(6);
@@ -114,15 +121,14 @@ namespace upper
             }
             catch (Exception ex)
             {
-                //ControlStatusText.Text = "媒体服务初始化失败";
-                //ControlStatusText.Foreground = System.Windows.Media.Brushes.Red;
+                System.Diagnostics.Debug.WriteLine($"媒体服务初始化失败: {ex.Message}");
             }
         }
 
         // 初始化托盘服务
         private void InitializeTrayService()
         {
-            string iconPath = GetEmbeddedIconAsTempFile();
+            string? iconPath = GetEmbeddedIconAsTempFile();
             if (!string.IsNullOrEmpty(iconPath))
             {
                 // 可以用在 NotifyIcon 等需要文件路径的地方
@@ -149,7 +155,7 @@ namespace upper
         }
 
         // 获取托盘图标
-        public string GetEmbeddedIconAsTempFile()
+        public string? GetEmbeddedIconAsTempFile()
         {
             Assembly assembly = Assembly.GetExecutingAssembly();
             string resourceName = "upper.Assets.icon.ico";
@@ -188,6 +194,7 @@ namespace upper
             }
             catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine($"开机自启动状态检测失败: {ex.Message}");
                 Dispatcher.Invoke(() =>
                 {
                     AutoStartCheckBox.IsEnabled = false;
@@ -236,9 +243,9 @@ namespace upper
 
         // ==================== 媒体事件处理 ====================
         // 媒体信息变化事件处理
-        private async void OnMediaInfoChanged(object sender, MediaService.MediaInfoChangedEventArgs e)
+        private async void OnMediaInfoChanged(object? sender, MediaService.MediaInfoChangedEventArgs e)
         {
-            // 在UI线程上更新媒体信息显示
+            // 立即更新文本显示，保证响应速度（数据可能滞后，防抖后会用新鲜数据修正）
             await Dispatcher.InvokeAsync(() =>
             {
                 TitleTextBlock.Text = e.Title;
@@ -246,27 +253,85 @@ namespace upper
                 AlbumTextBlock.Text = e.Album;
             });
 
-            // 媒体身份去重：同一歌曲在播放/暂停状态变化时，SMTC 可能重复触发 MediaPropertiesChanged，
-            // 但标题/艺术家/专辑未变，此时跳过封面重新处理。
-            bool identityChanged = e.Title != _lastMediaTitle
-                                || e.Artist != _lastMediaArtist
-                                || e.Album != _lastMediaAlbum;
+            // SMTC 的 MediaPropertiesChanged 触发瞬间，会话属性可能尚未更新——
+            // 此时读到的标题/缩略图还是上一个媒体的。若直接使用事件数据，
+            // 会把新标题与旧封面绑定，后续真正的封面事件又被去重吞掉，
+            // 表现为"上位机显示上一个视频的封面且不再更新"（2026-09-23 实机复现）。
+            // 对策：两段式主动拉取——120ms 后首拉（尽快出图），500ms 后确认拉取
+            // （兜住滞后的缩略图更新；下游 hash 判重保证确认阶段不会重复发图）。
+            _mediaDebounceCts?.Cancel();
+            _mediaDebounceCts = new CancellationTokenSource();
+            var token = _mediaDebounceCts.Token;
 
-            // 处理专辑封面（如果有）
-            if (e.ThumbnailStream is Windows.Storage.Streams.IRandomAccessStreamReference thumbnailRef)
+            _ = ProcessMediaPipelineWithConfirmationAsync(token);
+        }
+
+        // 两段式媒体处理流水线：首拉求快，确认拉取求准
+        private async Task ProcessMediaPipelineWithConfirmationAsync(CancellationToken token)
+        {
+            try
             {
-                if (!identityChanged && _currentImageRgb565Data != null)
+                await Task.Delay(MediaFirstFetchDelay, token);
+            }
+            catch (OperationCanceledException)
+            {
+                return; // 120ms 内又来了新事件，由新事件接管
+            }
+
+            var fresh = await _mediaService.GetCurrentMediaInfoAsync();
+            if (fresh == null || token.IsCancellationRequested) return;
+
+            await ProcessFreshMediaInfoAsync(fresh, forceHashCheck: false);
+
+            // 确认阶段：SMTC 缩略图可能滞后于标题更新，500ms 时再拉一次校验。
+            // 若缩略图已更新为真正的新图，hash 会不同并触发重处理；若无变化，hash 相同直接跳过。
+            try
+            {
+                await Task.Delay(MediaConfirmFetchDelay - MediaFirstFetchDelay, token);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            var confirm = await _mediaService.GetCurrentMediaInfoAsync();
+            if (confirm == null || token.IsCancellationRequested) return;
+
+            await ProcessFreshMediaInfoAsync(confirm, forceHashCheck: true);
+        }
+
+        // 用一份新鲜的媒体数据刷新 UI 并进入封面处理流水线
+        // forceHashCheck=true 时跳过身份捷径，强制做缩略图 hash 比对（用于确认阶段）
+        private async Task ProcessFreshMediaInfoAsync(MediaService.MediaInfoChangedEventArgs info, bool forceHashCheck)
+        {
+            await Dispatcher.InvokeAsync(() =>
+            {
+                TitleTextBlock.Text = info.Title;
+                ArtistTextBlock.Text = info.Artist;
+                AlbumTextBlock.Text = info.Album;
+            });
+
+            bool identityChanged = info.Title != _lastMediaTitle
+                                || info.Artist != _lastMediaArtist
+                                || info.Album != _lastMediaAlbum;
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[Media] 拉取数据: {info.Title} / {info.Artist} (上次: {_lastMediaTitle}, 身份变化: {identityChanged}, 强制hash: {forceHashCheck})");
+
+            if (info.ThumbnailStream is Windows.Storage.Streams.IRandomAccessStreamReference thumbnailRef)
+            {
+                if (!forceHashCheck && !identityChanged && _currentImageRgb565Data != null)
                 {
-                    // 同一媒体且已处理过封面，跳过
+                    // 同一媒体且已处理过封面，跳过（播放/暂停触发的重复事件走这里，无需解码）
                     return;
                 }
 
                 // 注意：_lastMediaTitle/_lastImageHash 不在此处更新，
                 // 而是放到 ProcessAlbumArtAsync 中，在确认缩略图 hash 真正变化后再更新。
                 // 这样可以避免 SMTC 缩略图滞后（标题已变但缩略图还是旧图）导致的错位。
-                var title = e.Title;
-                var artist = e.Artist;
-                var album = e.Album;
+                var title = info.Title;
+                var artist = info.Artist;
+                var album = info.Album;
 
                 // 图片处理涉及大量 DispatcherObject，统一放到 UI 线程执行
                 await Dispatcher.InvokeAsync(async () => await ProcessAlbumArtAsync(thumbnailRef, title, artist, album));
@@ -287,7 +352,7 @@ namespace upper
         }
 
         // 播放状态变化事件处理
-        private void OnPlaybackStateChanged(object sender, MediaService.PlaybackStateChangedEventArgs e)
+        private void OnPlaybackStateChanged(object? sender, MediaService.PlaybackStateChangedEventArgs e)
         {
             Dispatcher.Invoke(() =>
             {
@@ -307,7 +372,7 @@ namespace upper
         }
 
         // 媒体会话可用性变化事件处理
-        private void OnSessionAvailabilityChanged(object sender, bool isAvailable)
+        private void OnSessionAvailabilityChanged(object? sender, bool isAvailable)
         {
             Dispatcher.Invoke(() =>
             {
@@ -366,10 +431,24 @@ namespace upper
         {
             // 串行化封面处理，避免 SMTC 快速重复事件并发进入导致同一封面被发送两次
             await _processAlbumArtLock.WaitAsync();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             try
             {
+                // 跨会话切换后旧会话的缩略图流可能永远读不出来；
+                // 加 3 秒超时，防止 _processAlbumArtLock 被永久占用导致整个封面流水线锁死
+                var openTask = thumbnailRef.OpenReadAsync().AsTask();
+                if (await Task.WhenAny(openTask, Task.Delay(3000)) != openTask)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[Media] 缩略图读取超时(3s)，跳过: {title}");
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        ImageTransferStatusText.Text = "缩略图读取超时，跳过本次封面处理";
+                    });
+                    return;
+                }
+
                 // 加载原始图像
-                using (var stream = await thumbnailRef.OpenReadAsync())
+                using (var stream = openTask.Result)
                 {
                     var originalBitmap = new System.Windows.Media.Imaging.BitmapImage();
                     originalBitmap.BeginInit();
@@ -378,18 +457,10 @@ namespace upper
                     originalBitmap.EndInit();
                     originalBitmap.Freeze();
 
-                    // 同一媒体身份且已经处理过封面，直接跳过。
-                    // 这能防止 SMTC 缩略图滞后（标题已更新但缩略图还是旧图，或反之）
-                    // 导致的旧图覆盖新图。
-                    bool sameIdentity = title == _lastMediaTitle
-                                     && artist == _lastMediaArtist
-                                     && album == _lastMediaAlbum;
-                    if (sameIdentity && _currentImageRgb565Data != null)
-                    {
-                        return;
-                    }
-
-                    // 检测图片是否变化
+                    // 图片 hash 是唯一去重判据，同时覆盖两种场景：
+                    // 1. SMTC 缩略图滞后（标题已变但缩略图还是旧图）→ hash 相同，跳过且不烧身份；
+                    // 2. 同一身份下缩略图滞后更新（确认阶段强制进入）→ hash 不同，正常处理。
+                    // 因此不再使用"同身份直接跳过"的捷径——它会把确认阶段的合法更新挡在门外。
                     string newHash = ImageProcessor.ComputeImageHash(originalBitmap);
                     if (newHash == _lastImageHash)
                     {
@@ -431,16 +502,9 @@ namespace upper
                         return;
                     }
 
-                    // 关键：异步处理期间用户可能已切换到其他视频，校验身份是否仍匹配。
-                    // 若已切换，则丢弃本次结果，避免发送过时的封面。
-                    if (title != _lastMediaTitle || artist != _lastMediaArtist || album != _lastMediaAlbum)
-                    {
-                        await Dispatcher.InvokeAsync(() =>
-                        {
-                            ImageTransferStatusText.Text = "封面已过期，跳过发送";
-                        });
-                        return;
-                    }
+                    // 注意：此处不再做"编码后身份复核"。_processAlbumArtLock 已串行化整个处理流程，
+                    // 且 _lastMediaTitle 等字段仅由本函数在持锁期间更新，复核条件恒不成立（原为死代码）。
+                    // 防封面错位的真实机制：semaphore 串行化 + 缩略图 hash 检查 + StartImageTransfer 的 pending 替换。
 
                     _currentImageRgb565Data = rgb565Data;
 
@@ -454,6 +518,9 @@ namespace upper
 
                     // 启动图片传输状态机
                     StartImageTransfer(rgb565Data);
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Media] 封面处理完成，耗时 {sw.ElapsedMilliseconds}ms: {title}");
                 }
             }
             catch (Exception ex)
@@ -511,6 +578,7 @@ namespace upper
             }
             catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine($"默认浏览器打开失败，尝试备用方式: {ex.Message}");
                 // 如果第一种方法失败，尝试另一种方法
                 try
                 {
@@ -543,7 +611,7 @@ namespace upper
         // ==================== 串口事件处理 ====================
 
         // 串口连接状态变化事件处理
-        private async void OnSerialConnectionChanged(object sender, bool isConnected)
+        private async void OnSerialConnectionChanged(object? sender, bool isConnected)
         {
             await Dispatcher.InvokeAsync(async () =>
             {
@@ -634,7 +702,7 @@ namespace upper
         }
 
         // 串口状态消息事件处理
-        private void OnSerialStatusMessage(object sender, string message)
+        private void OnSerialStatusMessage(object? sender, string message)
         {
             // 将串口状态消息显示在 UI 上，便于现场诊断
             Dispatcher.InvokeAsync(() =>
@@ -644,9 +712,10 @@ namespace upper
         }
 
         // 串口命令接收事件处理
-        private void OnSerialCommandReceived(object sender, SerialPortService.SerialCommandReceivedEventArgs e)
+        // 用 InvokeAsync 而非 Invoke：避免 UI 繁忙时同步阻塞串口接收线程造成反压
+        private void OnSerialCommandReceived(object? sender, SerialPortService.SerialCommandReceivedEventArgs e)
         {
-            Dispatcher.Invoke(() => ProcessSerialCommand(e));
+            Dispatcher.InvokeAsync(() => ProcessSerialCommand(e));
         }
 
         // 处理串口接收到的结构化命令
@@ -761,6 +830,7 @@ namespace upper
             }
 
             ImageTransferStatusText.Text = $"准备传输图片 (transfer {currentTransferId})，发送 /t 等待 /k...";
+            _transferStartTime = DateTime.Now;
             _serialPortService.SendImageStartCommand();
 
             // /k 可能因下位机 TX 忙而丢失；主动重试 /t，若仍未收到 /k 则直接开始发图
@@ -806,7 +876,9 @@ namespace upper
                     ImageTransferStatusText.Text = $"开始传输图片，共 {totalPackets} 包...";
                 });
 
-                const int BATCH_SIZE = 8;
+                // 批量 16 包、每批一次 Flush（原 8 包/Flush 刷新次数过多，实测延迟偏高；
+                // 若下位机出现丢包，/r /x 重传机制可自愈）
+                const int BATCH_SIZE = 16;
                 for (int i = 0; i < totalPackets; i += BATCH_SIZE)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -847,7 +919,29 @@ namespace upper
             }
             catch (OperationCanceledException)
             {
-                // 正常取消，忽略
+                // 传输被取消（通常是更新的封面在排队）。取消时状态机仍停留在 Transferring，
+                // 必须在此复位并启动 pending，否则阶段永久卡死、后续封面全部无法下发
+                // （2026-09-23 实机复现：PotPlayer↔B站 跨会话切换后锁死在旧封面）。
+                // 下位机收到下一次 /t 会自行丢弃残包并重置接收状态，直接放弃当前传输是安全的。
+                byte[]? pending = null;
+                lock (_imageTransferLock)
+                {
+                    if (_transferId == transferId && _imagePhase == ImageTransferPhase.Transferring)
+                    {
+                        _imagePhase = ImageTransferPhase.Idle;
+                        pending = _pendingImageData;
+                        _pendingImageData = null;
+                    }
+                }
+
+                if (pending != null)
+                {
+                    // 稍等片刻再启动新图，给下位机状态机留出过渡时间
+                    _ = Task.Delay(300).ContinueWith(_ =>
+                    {
+                        Dispatcher.Invoke(() => StartImageTransfer(pending));
+                    });
+                }
             }
             catch (Exception ex)
             {
@@ -884,6 +978,8 @@ namespace upper
             }
 
             ImageTransferStatusText.Text = "✅ 收到 /a，图片发送完成";
+            System.Diagnostics.Debug.WriteLine(
+                $"[Transfer] /t→/a 耗时 {(DateTime.Now - _transferStartTime).TotalMilliseconds:F0}ms");
 
             // 图片到位后同步当前播放状态，确保摇臂位置与 PC 一致，
             // 但只在 PC 状态与下位机 believed state 不一致时才发送 topic，避免误切换。
@@ -915,7 +1011,11 @@ namespace upper
             }
             catch (OperationCanceledException)
             {
-                return;
+                // 取消不代表可以撒手不管：取消只意味着有更新的图在排队。
+                // 若此刻仍处于原阶段（例如 /a 永远不会来的 AwaitingAck），
+                // 必须继续走下面的超时收尾逻辑，否则状态机永久卡死。
+                // 注意：收到 /a 的正常路径里 HandleImageTransferAck 也会取消 CTS，
+                // 但那时阶段已变为 Completed，下面的阶段检查会正确放行。
             }
 
             lock (_imageTransferLock)
@@ -1116,15 +1216,33 @@ namespace upper
         }
 
         // 图片包发送事件处理
-        private void OnImagePacketSent(object sender, SerialPortService.ImagePacketEventArgs e)
+        // 一张封面 1888 个包，每包都 Dispatcher 调度会把 UI 线程淹掉；
+        // 失败立即上报，成功进度每 128 包或最后一包才刷新一次。
+        private int _lastPacketProgressReported = -1;
+
+        private void OnImagePacketSent(object? sender, SerialPortService.ImagePacketEventArgs e)
         {
-            Dispatcher.Invoke(() =>
+            if (e.Success)
+            {
+                bool isLast = e.PacketIndex + 1 >= e.TotalPackets;
+                if (!isLast && e.PacketIndex - _lastPacketProgressReported < 128)
+                {
+                    return;
+                }
+                _lastPacketProgressReported = e.PacketIndex;
+            }
+            else
+            {
+                // 失败后重置进度采样，让下一批传输从头开始上报
+                _lastPacketProgressReported = -1;
+            }
+
+            Dispatcher.InvokeAsync(() =>
             {
                 if (e.Success)
                 {
                     ImageTransferStatusText.Text =
-                        $"发送进度: {e.PacketIndex + 1}/{e.TotalPackets} 包 " +
-                        $"(字节 {e.DataStartIndex}-{e.DataStartIndex + e.DataLength})";
+                        $"发送进度: {e.PacketIndex + 1}/{e.TotalPackets} 包";
                 }
                 else
                 {
@@ -1146,7 +1264,7 @@ namespace upper
         }
 
         // 播放状态定时发送事件
-        private void StatusSendTimer_Tick(object sender, EventArgs e)
+        private void StatusSendTimer_Tick(object? sender, EventArgs e)
         {
             if (!_serialPortService.IsConnected) return;
 
@@ -1166,7 +1284,7 @@ namespace upper
         }
 
         // 自动重连定时器事件
-        private void AutoReconnectTimer_Tick(object sender, EventArgs e)
+        private void AutoReconnectTimer_Tick(object? sender, EventArgs e)
         {
             if (!_serialPortService.IsConnected)
             {
@@ -1309,6 +1427,21 @@ namespace upper
             {
                 HideWindowToTray();
             }
+        }
+
+        /// <summary>
+        /// 进程退出前统一释放各服务资源。
+        /// 不清理会导致进程退出后托盘图标残留（鼠标划过才消失）、串口/媒体会话句柄悬挂。
+        /// 由 App.OnExit 调用；关闭到托盘不会触发。
+        /// </summary>
+        public void CleanupServices()
+        {
+            try { _statusSendTimer?.Stop(); } catch { }
+            try { _autoReconnectTimer?.Stop(); } catch { }
+            try { _imageTransferCts?.Cancel(); } catch { }
+            try { _mediaService?.Dispose(); } catch { }
+            try { _serialPortService?.Dispose(); } catch { }
+            try { _trayService?.Dispose(); } catch { }
         }
 
     }

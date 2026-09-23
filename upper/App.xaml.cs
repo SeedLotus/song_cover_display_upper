@@ -15,13 +15,12 @@ namespace upper
     {
         // 单实例互斥锁
         private const string UniqueMutexName = "realTiX.CoverDisplay.UniqueMutex";
-        private static Mutex _mutex;
+        private static Mutex? _mutex;
         private static bool _isAnotherInstanceRunning;
         public static bool IsSecondInstance { get; private set; }
 
-        // IPC通信常量
-        public const int WM_SHOW_APP = 0x0400 + 1; // 自定义消息
-        private const int HWND_BROADCAST = 0xFFFF;
+        // IPC 服务（命名管道，第二实例通知主实例弹窗）
+        private IpcService? _ipcService;
 
         private bool _silentStart;
 
@@ -34,8 +33,11 @@ namespace upper
             {
                 IsSecondInstance = true;
 
-                // 尝试通过命名管道发送信号
-                bool signalSent = IpcService.SendShowWindowSignal();
+                // 尝试通过命名管道通知主实例弹窗
+                if (!IpcService.SendShowWindowSignal())
+                {
+                    Debug.WriteLine("已向主实例发送窗口恢复信号失败（主实例可能正在退出）");
+                }
 
                 // 立即关闭当前实例
                 Shutdown();
@@ -61,13 +63,13 @@ namespace upper
 
         private void StartIpcServer()
         {
-            var ipcService = new IpcService();
-            ipcService.ShowWindowRequested += (s, e) =>
+            _ipcService = new IpcService();
+            _ipcService.ShowWindowRequested += (s, e) =>
             {
                 // 在UI线程上恢复窗口
                 Dispatcher.Invoke(() => RestoreMainWindow());
             };
-            ipcService.StartServer();
+            _ipcService.StartServer();
         }
 
         private void CheckForExistingInstance()
@@ -126,7 +128,9 @@ namespace upper
 
         protected override void OnExit(ExitEventArgs e)
         {
-            // 清理资源
+            // 统一释放各服务资源（托盘图标、串口、媒体会话、IPC 管道）
+            (MainWindow as MainWindow)?.CleanupServices();
+            _ipcService?.Dispose();
             _mutex?.Close();
             base.OnExit(e);
         }

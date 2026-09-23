@@ -57,7 +57,7 @@ namespace upper.Services
         /// </summary>
         private string FindExeFilePath()
         {
-            string[] possiblePaths =
+            string?[] possiblePaths =
             {
                 // 1. 首先尝试直接获取当前进程的主模块
                 Process.GetCurrentProcess().MainModule?.FileName,
@@ -93,7 +93,7 @@ namespace upper.Services
             else if (exeFiles.Count > 1)
             {
                 // 如果有多个EXE，优先选择与程序集同名的
-                string assemblyName = System.Reflection.Assembly.GetEntryAssembly()?.GetName().Name;
+                string? assemblyName = System.Reflection.Assembly.GetEntryAssembly()?.GetName().Name;
                 if (!string.IsNullOrEmpty(assemblyName))
                 {
                     var matchingExe = exeFiles.FirstOrDefault(f =>
@@ -268,11 +268,12 @@ namespace upper.Services
         private void CreateShortcut(string shortcutPath, string targetPath, string description)
         {
             // 创建PowerShell命令来创建快捷方式
+            string workingDirectory = Path.GetDirectoryName(targetPath) ?? AppDomain.CurrentDomain.BaseDirectory;
             string powerShellCommand = $@"
                 $WshShell = New-Object -ComObject WScript.Shell
                 $Shortcut = $WshShell.CreateShortcut('{shortcutPath.Replace("'", "''")}')
                 $Shortcut.TargetPath = '{targetPath.Replace("'", "''")}'
-                $Shortcut.WorkingDirectory = '{Path.GetDirectoryName(targetPath).Replace("'", "''")}'
+                $Shortcut.WorkingDirectory = '{workingDirectory.Replace("'", "''")}'
                 $Shortcut.Arguments = '--silent'
                 $Shortcut.Description = '{description.Replace("'", "''")}'
                 $Shortcut.IconLocation = '{targetPath.Replace("'", "''")},0'
@@ -292,6 +293,11 @@ namespace upper.Services
 
             using (var process = Process.Start(startInfo))
             {
+                if (process == null)
+                {
+                    throw new ApplicationException("无法启动 PowerShell 进程");
+                }
+
                 string output = process.StandardOutput.ReadToEnd();
                 string error = process.StandardError.ReadToEnd();
                 process.WaitForExit(5000);

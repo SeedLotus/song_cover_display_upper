@@ -1,8 +1,8 @@
 # 歌曲封面显示唱片机上位机开发日志
 
 > 本文件记录 `song_cover_display_upper` 的开发修复、待修复问题、未来需求以及调试过程中的关键观察。  
-> 维护者：Claude Code  
-> 最后更新：2026-07-15
+> 维护者：Claude Code / WorkBuddy  
+> 最后更新：2026-09-23
 
 ---
 
@@ -150,6 +150,66 @@
 - **根因**：`/a` 超时后上位机重试 `/o`，下位机每次收到 `/o` 都会播放一次下落动画；若第一次 `/o` 未丢失，下位机就会播放两次。
 - **修复**：取消 `/o` 重试；`/a` 超时后依赖后续切换视频重新传输，或重连后的 autoRetry 机制。
 
+### 2.20 图片包发送事件 UI 刷新节流（2026-09-23）
+
+- **问题**：`OnImagePacketSent` 每发一个包都 `Dispatcher.Invoke` 刷新状态栏，一张封面 1888 包 = 1888 次 UI 线程调度，与 2.13 的批量发送优化自相矛盾。
+- **修复**：发送失败立即上报；成功进度每 128 包或最后一包才刷新一次；`Invoke` 改为 `InvokeAsync`。
+
+### 2.21 批量发包锁粒度上提（2026-09-23）
+
+- **问题**：`SendImagePacketRange` 逐包调用 `SendImagePacket`，每包独立 `lock/unlock`，批与批之间其他命令（心跳、`/q` 响应等）可插入发送，理论上会打乱包序。
+- **修复**：提取 `SendImagePacketCore`（假定已持锁），`SendImagePacketRange` 在单次 `_serialLock` 内发完整批；同时把 `SendImagePacket` 的异常断开策略与 `SendString`/`SendBytes` 对齐（任何异常都断开重连，原来只对 IOException/InvalidOperationException 断开）。
+
+### 2.22 移除封面处理死代码身份复核（2026-09-23）
+
+- **问题**：`ProcessAlbumArtAsync` 编码完成后的身份复核（`title != _lastMediaTitle` 等）是死代码——`_processAlbumArtLock` 串行化整个流程，且 `_lastMediaTitle` 等字段仅由该函数在持锁期间更新，复核条件恒不成立。
+- **修复**：移除死代码并注明真实保护机制（semaphore 串行化 + 缩略图 hash + `StartImageTransfer` pending 替换）。
+
+### 2.23 进程退出统一清理资源（2026-09-23）
+
+- **问题**：`App.OnExit` 只关闭 Mutex，`TrayService`/`SerialPortService`/`MediaService`/`IpcService` 均未 Dispose，进程退出后托盘图标残留（鼠标划过才消失），串口/媒体会话句柄悬挂。
+- **修复**：`MainWindow` 新增 `CleanupServices()` 统一停定时器、取消传输、Dispose 三个服务；`App` 持有 `IpcService` 引用并在 `OnExit` 中一并清理。
+
+### 2.24 图像处理与杂项清理（2026-09-23）
+
+- **`ImageProcessor.CreateBlurredBackground`**：原实现创建 `BlurEffect` 和临时 `Image` 元素但从未实际渲染（死代码），所谓"模糊"实为缩小到约 20px 再放大的像素化柔焦。已移除死代码，视觉行为不变；删除无用的 `BLUR_RADIUS` 常量。
+- **占位图**：原来分两次在同一坐标绘制 "T X" 和 "i" 互相重叠，合并为单次绘制 "TiX"。
+- **串口命令分发**：`OnSerialCommandReceived` 由 `Dispatcher.Invoke` 改为 `InvokeAsync`，避免 UI 繁忙时同步阻塞串口接收线程。
+- **`App.xaml.cs`**：移除被命名管道取代后的死常量 `WM_SHOW_APP`/`HWND_BROADCAST`；第二实例 IPC 信号发送失败时输出调试日志。
+- **`MediaService.UpdatePlaybackInfoAsync`**：`GetPlaybackInfo` 为同步 API，移除多余的 async 修饰（CS1998）。
+- **编译警告归零**：修复全部 nullable 标注问题（事件 sender 参数、`GetEmbeddedIconAsTempFile` 返回类型、`IpcService`/`AutoStartManager` 字段与局部变量）及未使用的 `ex` 变量。`dotnet build` 从 27 警告降至 0 警告 0 错误。
+
+### 2.25 防抖 + 主动重取修复 SMTC 事件数据滞后（2026-09-23，实机复现后修复）
+
+- **现象**：多次切换视频后，上位机窗口显示的是**上一个视频**的封面且不再更新，下位机随之卡住（README 第六节"新旧封面闪烁"已知问题的顽固形态）。
+- **根因**：SMTC 的 `MediaPropertiesChanged` 触发瞬间，会话属性尚未更新——读到的是上一个媒体的标题/缩略图。旧代码直接使用事件时刻的数据，把新身份与旧封面绑定；随后真正的新封面事件因身份已被"更新"而被去重逻辑跳过，流水线永久卡死在旧封面。
+- **修复**：
+  - `MediaService` 新增 `GetCurrentMediaInfoAsync()`，主动拉取当前会话最新媒体属性。
+  - `MainWindow.OnMediaInfoChanged` 改为：立即用事件数据刷新文本（保证响应），然后防抖 400ms（期间新事件会取消旧防抖），再调用 `GetCurrentMediaInfoAsync` 获取可信数据，修正文本并进入封面处理流水线。
+  - 下游去重逻辑（身份判断 → hash 兜底 → semaphore 串行化）不变。
+  - 增加 `[Media]` 前缀的 Debug 日志，记录防抖后的标题对比。
+
+### 2.26 封面切换延迟优化（2026-09-23）
+
+- **背景**：2.25 修复正确性后实机反馈切换延迟偏大。
+- **优化项**：
+  - 固定 400ms 防抖改为两段式拉取：120ms 首拉（尽快出图）+ 500ms 确认拉取（兜住 SMTC 滞后缩略图）。确认阶段通过 `forceHashCheck` 绕过身份捷径。
+  - `ProcessAlbumArtAsync` 去重改为**纯 hash 判据**，移除"同身份直接跳过"捷径（它会挡住确认阶段的合法缩略图更新）；播放/暂停重复事件仍由上层身份捷径挡在解码之前，无额外开销。
+  - 串口批量发送从 8 包/Flush 放宽到 16 包/Flush（236→118 次刷新）；丢包风险由 `/r`、`/x` 重传机制兜底，若实机出现掉初始化需回退此项。
+  - 增加耗时日志：`[Media] 封面处理完成，耗时 Xms`、`[Transfer] /t→/a 耗时 Xms`，供实机定位瓶颈。
+
+### 2.27 修复传输取消后状态机死锁（2026-09-23，实机复现）
+
+- **现象**：PotPlayer 与 B站视频互相切换（跨 SMTC 会话）后，下位机锁死在 PotPlayer 封面，后续封面全部无法切换。
+- **根因**：2.16 引入的 pending 机制存在收尾缺陷。新封面到达时若当前传输处于 `Transferring`/`AwaitingAck`，`StartImageTransfer` 会排队 pending 并取消当前传输，但被取消的一方均不复位状态：
+  - `SendImageAsync` 捕获 `OperationCanceledException` 后直接"忽略"，`_imagePhase` 永久卡在 `Transferring`；
+  - `WaitForPhaseTimeoutAsync` 的 `Task.Delay` 被取消后直接 return，超时保护失效，可能永久卡在 `AwaitingAck`。
+  - 此后所有 `StartImageTransfer` 都走 pending 分支无限排队，状态机死锁。
+- **修复**：
+  - `SendImageAsync` 取消时：若仍是当前传输且处于 `Transferring`，复位为 `Idle` 并延迟 300ms 启动 pending 新图（下位机收到下一次 `/t` 会自行丢弃残包）。
+  - `WaitForPhaseTimeoutAsync` 取消后不再直接返回，继续走阶段检查与超时收尾；收到 `/a` 的正常路径因阶段已变为 `Completed` 不受影响。
+  - 防御性：`OpenReadAsync` 增加 3 秒超时，防止跨会话后旧会话缩略图流读挂导致 `_processAlbumArtLock` 被永久占用。
+
 ---
 
 ## 三、待修复问题
@@ -197,6 +257,14 @@
 - **当前策略**：保持一次自动完整重试；若仍失败，依赖用户切换第二个视频恢复。
 - **彻底修复方向**：必须修改下位机固件，初始化 `pack_get_lost_counter` 中的循环变量。
 
+### 3.6 保活心跳与下位机 60 秒休眠的协议矛盾（2026-09-23 新识别，固件阻塞）
+
+- **现象推测**：README 协议要求"上位机需定期发送 `/1` 或 `/0` 避免下位机 60 秒休眠"，但 2.18 重构后 `SyncPlaybackStatusToLowerMachine()` 只在 PC 状态与下位机 believed state **不一致**时才发 topic，状态一致时 `StatusSendTimer` 每秒空转、实际什么都不发 → 正常听歌约 60 秒后下位机可能休眠。
+- **矛盾本质**：下位机把 `/1`、`/0` 当作"切换状态"的 topic 而非幂等的"设置状态"，周期心跳会翻转摇臂；不发又会休眠。上位机单侧无法两全。
+- **疑似关联**：README 第六节"上位机挂后台太久时可能不会响应下位机的手动拨动唱臂命令"可能并非上位机失活，而是下位机已休眠。
+- **待验证**：实机测试——连接后正常播放 60 秒以上不做任何操作，观察屏幕是否熄灭、拨唱臂是否无响应。
+- **彻底修复方向**（需改固件，暂缓）：`/1`、`/0` 改为幂等的"设置状态"语义，或新增专用心跳命令（如 `/h`）仅刷新休眠计时器不改变状态。在固件修复前，上位机侧保持现状不改。
+
 ---
 
 ## 四、未来新需求
@@ -221,6 +289,12 @@
 | 2026-07-16 | 封面切换与摇臂控制 | 通过 | 取消 `/o` 重试、引入下位机 believed state 后，封面只落下 1 次，摇臂控制恢复正常 |
 | 2026-07-16 | 偶发 AwaitingAck 超时提示 | 未修复 | 不影响实际封面显示，需配合下位机固件修复 `/a` 回包可靠性 |
 | 2026-07-16 | 重连后首个视频封面 | 未修复 | 核心根因指向下位机 `pack_get_lost_counter` 未初始化，上位机侧已尽力兼容 |
+| 2026-09-23 | 全面代码审查 + dotnet build | 通过 | 0 错误；修复前 27 警告，修复后 0 警告 |
+| 2026-09-23 | 本轮质量修复（2.20-2.24） | 通过 | 启动/单实例、自动连接、封面同步、切换流畅度、播放暂停双向、拔插重连、退出托盘清理均符合预期 |
+| 2026-09-23 | B站多次切换封面错位卡死 | 已修复 | 实机复现"上位机显示上一个视频封面"，根因 SMTC 事件数据滞后，2.25 防抖+主动重取修复 |
+| 2026-09-23 | PotPlayer↔B站跨会话切换锁死 | 已修复 | 根因为 pending 机制取消传输后状态机不复位（2.16 遗留缺陷），2.27 修复 |
+| 2026-09-23 | 封面切换延迟 | 可接受 | 2.26 两段式拉取（120ms+500ms）+ 16 包/Flush，用户确认延迟可接受、无掉初始化 |
+| 2026-09-23 | 重连后首个视频封面 | 未修复（复现） | 3.5 按预期复现：首个封面同步失败，切下一视频恢复；固件问题，本轮不修 |
 
 ---
 

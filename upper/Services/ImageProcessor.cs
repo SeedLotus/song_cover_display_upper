@@ -16,8 +16,7 @@ namespace upper.Services
     {
         // 配置常量
         public const int TARGET_SIZE = 240;          // 目标正方形边长
-        private const int BACKGROUND_SIZE = 20;     // 模糊背景的参考尺寸
-        private const double BLUR_RADIUS = 20.0;     // 模糊效果半径，没用，ai 乱写的，只能改上面这个把图片拉小再拉大，会有栅格感
+        private const int BACKGROUND_SIZE = 20;     // 背景先缩小到的参考尺寸（再放大回 240，形成像素化柔焦）
 
         /// <summary>
         /// 主处理方法：将任意尺寸的专辑封面处理为240x240的智能适配图像
@@ -50,92 +49,34 @@ namespace upper.Services
         }
 
         /// <summary>
-        /// 创建模糊背景
+        /// 创建背景图：先把原图缩小到约 BACKGROUND_SIZE 像素，再放大回 240x240，
+        /// 靠剧烈的缩放插值形成"像素化柔焦"背景。
+        /// （原实现中的 BlurEffect 路径是死代码——模糊效果从未被实际渲染，已移除。）
         /// </summary>
         private static BitmapSource CreateBlurredBackground(BitmapSource source)
         {
-            // 1. 缩小原图以生成背景（性能优化）
+            // 1. 大幅缩小原图（确保不会放大）
             double backgroundScale = BACKGROUND_SIZE / (double)Math.Min(source.PixelWidth, source.PixelHeight);
-            backgroundScale = Math.Min(backgroundScale, 1.0); // 确保不会放大
+            backgroundScale = Math.Min(backgroundScale, 1.0);
 
-            var backgroundScaler = new TransformedBitmap();
-            backgroundScaler.BeginInit();
-            backgroundScaler.Source = source;
-            backgroundScaler.Transform = new ScaleTransform(backgroundScale, backgroundScale);
-            backgroundScaler.EndInit();
-            backgroundScaler.Freeze();
+            var downscaled = new TransformedBitmap();
+            downscaled.BeginInit();
+            downscaled.Source = source;
+            downscaled.Transform = new ScaleTransform(backgroundScale, backgroundScale);
+            downscaled.EndInit();
+            downscaled.Freeze();
 
-            // 2. 创建临时图像并应用模糊效果
-            // 首先将缩放后的图像渲染到RenderTargetBitmap
-            var tempDrawingVisual = new DrawingVisual();
-            using (var tempDrawingContext = tempDrawingVisual.RenderOpen())
-            {
-                tempDrawingContext.DrawImage(backgroundScaler,
-                    new Rect(0, 0, backgroundScaler.PixelWidth, backgroundScaler.PixelHeight));
-            }
+            // 2. 放大回目标尺寸，插值拉伸即为柔焦效果
+            var upscaled = new TransformedBitmap();
+            upscaled.BeginInit();
+            upscaled.Source = downscaled;
+            upscaled.Transform = new ScaleTransform(
+                TARGET_SIZE / (double)downscaled.PixelWidth,
+                TARGET_SIZE / (double)downscaled.PixelHeight);
+            upscaled.EndInit();
+            upscaled.Freeze();
 
-            var tempBitmap = new RenderTargetBitmap(
-                backgroundScaler.PixelWidth,
-                backgroundScaler.PixelHeight,
-                96, 96, PixelFormats.Pbgra32);
-            tempBitmap.Render(tempDrawingVisual);
-            tempBitmap.Freeze();
-
-            // 3. 创建一个包含模糊效果的图像
-            var blurredVisual = new DrawingVisual();
-            using (var blurredContext = blurredVisual.RenderOpen())
-            {
-                // 创建模糊效果
-                var blurEffect = new BlurEffect
-                {
-                    Radius = BLUR_RADIUS,
-                    KernelType = KernelType.Gaussian,
-                    RenderingBias = RenderingBias.Performance
-                };
-
-                // 创建一个临时的Image元素来承载模糊效果
-                var tempImage = new System.Windows.Controls.Image
-                {
-                    Source = tempBitmap,
-                    Effect = blurEffect,
-                    Width = backgroundScaler.PixelWidth,
-                    Height = backgroundScaler.PixelHeight
-                };
-
-                // 测量和排列临时Image元素
-                tempImage.Measure(new System.Windows.Size(tempImage.Width, tempImage.Height));
-                tempImage.Arrange(new Rect(0, 0, tempImage.Width, tempImage.Height));
-
-                // 渲染到DrawingContext
-                blurredContext.DrawImage(tempBitmap,
-                    new Rect(0, 0, tempImage.Width, tempImage.Height));
-
-                // 或者使用RenderTargetBitmap渲染Image元素
-                // 更简单的方法：直接绘制应用了模糊效果的图像
-            }
-
-            // 4. 渲染模糊图像
-            var blurredBitmap = new RenderTargetBitmap(
-                backgroundScaler.PixelWidth,
-                backgroundScaler.PixelHeight,
-                96, 96, PixelFormats.Pbgra32);
-            blurredBitmap.Render(blurredVisual);
-            blurredBitmap.Freeze();
-
-            // 5. 将模糊图像缩放到目标尺寸
-            var finalScaler = new TransformedBitmap();
-            finalScaler.BeginInit();
-            finalScaler.Source = blurredBitmap;
-
-            // 计算从模糊图像缩放到240x240的比例
-            double finalScaleX = TARGET_SIZE / (double)blurredBitmap.PixelWidth;
-            double finalScaleY = TARGET_SIZE / (double)blurredBitmap.PixelHeight;
-
-            finalScaler.Transform = new ScaleTransform(finalScaleX, finalScaleY);
-            finalScaler.EndInit();
-            finalScaler.Freeze();
-
-            return finalScaler;
+            return upscaled;
         }
 
         /// <summary>
@@ -314,9 +255,9 @@ namespace upper.Services
                     new Rect(0, 0, width, height)
                 );
 
-                // 绘制文本
+                // 绘制文本（原来分两次绘制 "T X" 和 "i"，坐标相同会互相重叠，合并为一次）
                 var text = new FormattedText(
-                    "T X",
+                    "TiX",
                     System.Globalization.CultureInfo.CurrentCulture,
                     System.Windows.FlowDirection.LeftToRight,
                     new Typeface("Arial"),
@@ -328,21 +269,6 @@ namespace upper.Services
                 // 居中显示
                 double x = (width - text.Width) / 2;
                 double y = (height - text.Height) / 2;
-                drawingContext.DrawText(text, new System.Windows.Point(x, y));
-
-                text = new FormattedText(
-                    "i",
-                    System.Globalization.CultureInfo.CurrentCulture,
-                    System.Windows.FlowDirection.LeftToRight,
-                    new Typeface("Arial"),
-                    Math.Min(width, height) * 0.4,
-                    System.Windows.Media.Brushes.DarkGray,
-                    VisualTreeHelper.GetDpi(drawingVisual).PixelsPerDip
-                );
-
-                // 居中显示
-                x = (width - text.Width) / 2;
-                y = (height - text.Height) / 2;
                 drawingContext.DrawText(text, new System.Windows.Point(x, y));
             }
 

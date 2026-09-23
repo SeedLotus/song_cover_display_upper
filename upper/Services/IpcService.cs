@@ -9,19 +9,20 @@ namespace upper.Services
 {
     public class IpcService : IDisposable
     {
-        private NamedPipeServerStream _pipeServer;
-        private CancellationTokenSource _cancellationTokenSource;
+        private NamedPipeServerStream? _pipeServer;
+        private CancellationTokenSource? _cancellationTokenSource;
         private bool _isDisposed;
 
-        public event EventHandler ShowWindowRequested;
+        public event EventHandler? ShowWindowRequested;
 
         public void StartServer()
         {
             _cancellationTokenSource = new CancellationTokenSource();
+            var token = _cancellationTokenSource.Token;
 
             Task.Run(async () =>
             {
-                while (!_cancellationTokenSource.Token.IsCancellationRequested)
+                while (!token.IsCancellationRequested)
                 {
                     try
                     {
@@ -33,7 +34,7 @@ namespace upper.Services
                             PipeOptions.Asynchronous);
 
                         // 等待客户端连接
-                        await _pipeServer.WaitForConnectionAsync(_cancellationTokenSource.Token);
+                        await _pipeServer.WaitForConnectionAsync(token);
 
                         // 读取数据
                         using (var reader = new StreamReader(_pipeServer))
@@ -104,6 +105,7 @@ namespace upper.Services
             {
                 _cancellationTokenSource?.Cancel();
                 _pipeServer?.Dispose();
+                _cancellationTokenSource?.Dispose();
                 _isDisposed = true;
             }
         }
