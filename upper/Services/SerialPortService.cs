@@ -732,6 +732,16 @@ namespace upper.Services
             return SendString("/o");
         }
 
+        /// <summary>
+        /// 发送心跳命令（配套 2026-09-23 后的新版固件：仅刷新下位机休眠计时，不改变播放状态）。
+        /// 旧固件会忽略未知命令，行为与之前一致（60 秒无命令后休眠）。
+        /// </summary>
+        /// <returns>发送是否成功</returns>
+        public bool SendHeartbeat()
+        {
+            return SendString("/h");
+        }
+
         // ==================== 数据接收 ====================
 
         /// <summary>

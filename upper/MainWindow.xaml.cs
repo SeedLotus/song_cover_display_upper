@@ -1280,7 +1280,17 @@ namespace upper
 
             // 与下位机 believed state 对比，只在不一致时补发 topic，
             // 避免下位机把周期心跳当成切换指令。
-            SyncPlaybackStatusToLowerMachine();
+            bool pcPlaying = _currentPlayStatus == "Playing";
+            if (pcPlaying != _lowerMachinePlaying)
+            {
+                SyncPlaybackStatusToLowerMachine();
+            }
+            else
+            {
+                // 状态一致时改发 /h 心跳（仅刷新下位机休眠计时，不碰播放状态机），
+                // 防止下位机 60 秒无命令进入休眠（DEV_LOG 3.6）。需配套新版固件。
+                _serialPortService.SendHeartbeat();
+            }
         }
 
         // 自动重连定时器事件
