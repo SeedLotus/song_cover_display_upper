@@ -45,7 +45,9 @@ namespace upper
             }
 
             IsSecondInstance = false;
-            _silentStart = e.Args.Contains("--silent", StringComparer.OrdinalIgnoreCase);
+            // 静默启动：命令行 --silent（开机自启快捷方式携带）或用户勾选了"静默启动"设置
+            var settings = AppSettings.Load();
+            _silentStart = e.Args.Contains("--silent", StringComparer.OrdinalIgnoreCase) || settings.SilentStart;
 
             // 这是第一个实例，正常启动
             base.OnStartup(e);

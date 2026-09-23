@@ -10,9 +10,14 @@ namespace upper.Services
         private NotifyIcon? _notifyIcon;
         private bool _isDisposed;
 
-        public event EventHandler? TrayIconLeftClick;
+        public event EventHandler? TrayIconDoubleClick;
         public event EventHandler? ExitRequested;
         public event EventHandler? OpenUrlRequested;
+        public event EventHandler? AutoStartToggleRequested;
+        public event EventHandler? SilentStartToggleRequested;
+
+        private ToolStripMenuItem? _autoStartItem;
+        private ToolStripMenuItem? _silentStartItem;
 
         public void Initialize(string tooltipText, Icon? customIcon = null)
         {
@@ -25,8 +30,8 @@ namespace upper.Services
                 Visible = true
             };
 
-            // 配置事件
-            _notifyIcon.MouseClick += OnNotifyIconMouseClick;
+            // 配置事件：双击呼出主窗口（单击易误触，且与双击会重复触发）
+            _notifyIcon.MouseDoubleClick += OnNotifyIconMouseDoubleClick;
 
             // 创建右键菜单
             CreateContextMenu();
@@ -39,8 +44,22 @@ namespace upper.Services
             var menu = new ContextMenuStrip();
 
             var showItem = new ToolStripMenuItem("显示主窗口");
-            showItem.Click += (s, e) => TrayIconLeftClick?.Invoke(this, EventArgs.Empty);
+            showItem.Click += (s, e) => TrayIconDoubleClick?.Invoke(this, EventArgs.Empty);
             menu.Items.Add(showItem);
+
+            // 可勾选项：开机自启动（勾选状态由 MainWindow 同步）
+            _autoStartItem = new ToolStripMenuItem("开机自启动") { CheckOnClick = true };
+            _autoStartItem.Click += (s, e) => AutoStartToggleRequested?.Invoke(this, EventArgs.Empty);
+            menu.Items.Add(_autoStartItem);
+
+            // 可勾选项：静默启动（勾选状态由 MainWindow 同步）
+            _silentStartItem = new ToolStripMenuItem("静默启动")
+            {
+                CheckOnClick = true,
+                ToolTipText = "勾选后，无论开机自启还是手动启动都不弹出主窗口，仅显示托盘图标"
+            };
+            _silentStartItem.Click += (s, e) => SilentStartToggleRequested?.Invoke(this, EventArgs.Empty);
+            menu.Items.Add(_silentStartItem);
 
             var websiteItem = new ToolStripMenuItem("作者B站");
             websiteItem.Click += (s, e) => OpenUrlRequested?.Invoke(this, EventArgs.Empty);
@@ -56,12 +75,12 @@ namespace upper.Services
             _notifyIcon.ContextMenuStrip = menu;
         }
 
-        private void OnNotifyIconMouseClick(object? sender, MouseEventArgs e)
+        private void OnNotifyIconMouseDoubleClick(object? sender, MouseEventArgs e)
         {
-            // 仅响应鼠标左键单击
+            // 仅响应鼠标左键双击
             if (e.Button == MouseButtons.Left)
             {
-                TrayIconLeftClick?.Invoke(this, EventArgs.Empty);
+                TrayIconDoubleClick?.Invoke(this, EventArgs.Empty);
             }
         }
 
@@ -75,6 +94,28 @@ namespace upper.Services
             if (_notifyIcon != null)
             {
                 _notifyIcon.Text = text;
+            }
+        }
+
+        /// <summary>
+        /// 同步"开机自启动"菜单项的勾选状态（以主窗口/AutoStartManager 的权威状态为准）
+        /// </summary>
+        public void SetAutoStartChecked(bool isChecked)
+        {
+            if (_autoStartItem != null)
+            {
+                _autoStartItem.Checked = isChecked;
+            }
+        }
+
+        /// <summary>
+        /// 同步"静默启动"菜单项的勾选状态（以 AppSettings 的权威状态为准）
+        /// </summary>
+        public void SetSilentStartChecked(bool isChecked)
+        {
+            if (_silentStartItem != null)
+            {
+                _silentStartItem.Checked = isChecked;
             }
         }
 

@@ -23,6 +23,7 @@ namespace upper
         private readonly MediaService _mediaService; // 系统媒体
         private readonly TrayService _trayService; // 托盘化
         private AutoStartManager _autoStartManager; // 开机自启动
+        private readonly AppSettings _appSettings; // 应用设置（静默启动等）
         private readonly SerialPortService _serialPortService; // 串口和下位机控制，ai 没把这两个解耦，就这样吧
 
 
@@ -92,6 +93,7 @@ namespace upper
             _trayService = new TrayService();
             _autoStartManager = new AutoStartManager();
             _serialPortService = new SerialPortService();
+            _appSettings = AppSettings.Load();
 
 
             // 初始化各模块
@@ -100,6 +102,9 @@ namespace upper
             InitializeAutoStart();
             InitializeSerialPortService();
             InitializeTimers();
+
+            // 初始化静默启动复选框状态（赋值会触发 Changed 事件，但值与磁盘一致，重复保存无害）
+            SilentStartCheckBox.IsChecked = _appSettings.SilentStart;
 
             // 启动时尝试自动连接设备
             AutoConnectDevice();
@@ -144,9 +149,14 @@ namespace upper
                 _trayService.Initialize("唱片机控制器 - @realTiX");
             }
 
-            // 订阅托盘事件
-            _trayService.TrayIconLeftClick += (s, e) => RestoreWindowFromTray();
+            // 订阅托盘事件（双击呼出窗口）
+            _trayService.TrayIconDoubleClick += (s, e) => RestoreWindowFromTray();
             _trayService.OpenUrlRequested += (s, e) => OpenWebsite();
+            // 托盘菜单切换开机自启动/静默启动：翻转主窗口复选框，复用其既有处理逻辑（权威状态在复选框一侧）
+            _trayService.AutoStartToggleRequested += (s, e) =>
+                AutoStartCheckBox.IsChecked = !(AutoStartCheckBox.IsChecked ?? false);
+            _trayService.SilentStartToggleRequested += (s, e) =>
+                SilentStartCheckBox.IsChecked = !(SilentStartCheckBox.IsChecked ?? false);
             _trayService.ExitRequested += (s, e) =>
             {
                 _isExitingFromTrayMenu = true;
@@ -1381,6 +1391,18 @@ namespace upper
                     MessageBoxButton.OK,
                     MessageBoxImage.Error);
             }
+
+            // 同步托盘菜单勾选状态（失败回滚后也会走到这里，保证托盘与复选框一致）
+            _trayService.SetAutoStartChecked(AutoStartCheckBox.IsChecked ?? false);
+        }
+
+        // 静默启动复选框状态改变：保存设置，下次启动生效
+        private void SilentStartCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            _appSettings.SilentStart = SilentStartCheckBox.IsChecked ?? false;
+            _appSettings.Save();
+            // 同步托盘菜单勾选状态
+            _trayService.SetSilentStartChecked(_appSettings.SilentStart);
         }
 
         // 连接按钮点击事件

@@ -45,9 +45,14 @@
                         <!-- 播放状态 -->
                         <TextBlock Grid.Column="0" x:Name="StatusTextBlock" FontSize="16" Foreground="Blue" 
                            Margin="0,0,0,10" Text="播放状态"/>
-                        <CheckBox Grid.Column="1" x:Name="AutoStartCheckBox" Content="开机自启动" 
-                          Margin="0,0,10,10" HorizontalAlignment="Right" VerticalAlignment="Bottom"
-                          Checked="AutoStartCheckBox_Checked" Unchecked="AutoStartCheckBox_Checked"/>
+                        <StackPanel Grid.Column="1" Orientation="Horizontal"
+                            Margin="0,0,10,10" HorizontalAlignment="Right" VerticalAlignment="Bottom">
+                            <CheckBox x:Name="SilentStartCheckBox" Content="静默启动" Margin="0,0,15,0"
+                              ToolTip="勾选后，无论开机自启还是手动启动，都不弹出本窗口，仅显示托盘图标。双击托盘图标可呼出窗口。"
+                              Checked="SilentStartCheckBox_Changed" Unchecked="SilentStartCheckBox_Changed"/>
+                            <CheckBox x:Name="AutoStartCheckBox" Content="开机自启动"
+                              Checked="AutoStartCheckBox_Checked" Unchecked="AutoStartCheckBox_Checked"/>
+                        </StackPanel>
                     </Grid>
                     <!-- 标题 -->
                     <TextBlock x:Name="TitleTextBlock" FontSize="22" FontWeight="Bold" Text="未知标题"
