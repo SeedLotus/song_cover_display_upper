@@ -364,3 +364,5 @@ FodyWeavers.xsd
 
 # Local temporary firmware clone used for protocol analysis
 _firmware_temp/
+# Local release publish output
+publish-v*/
