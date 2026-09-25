@@ -60,6 +60,10 @@ namespace upper
         // 因此上位机必须自己维护下位机 believed state，只在需要切换时发送 topic。
         private bool _lowerMachinePlaying = false;
 
+        // 固件协议版本：连接后发送 /v 查询，v2 固件回复 /v2（/1 /0 为幂等设态，不会翻转摇臂）。
+        // v1 固件静默忽略 /v，标志保持 false，全部走 legacy believed-state 行为。
+        private bool _firmwareSupportsIdempotentPlayback = false;
+
         private bool _autoRetryOnAckTimeout = false;  // 重连后首次封面同步 /a 超时是否自动重试一次
         private DateTime _transferStartTime;           // 本次传输开始时间（用于耗时日志）
 
@@ -325,8 +329,8 @@ namespace upper
                                 || info.Artist != _lastMediaArtist
                                 || info.Album != _lastMediaAlbum;
 
-            System.Diagnostics.Debug.WriteLine(
-                $"[Media] 拉取数据: {info.Title} / {info.Artist} (上次: {_lastMediaTitle}, 身份变化: {identityChanged}, 强制hash: {forceHashCheck})");
+            FileLogger.Log("Media",
+                $"拉取数据: {info.Title} / {info.Artist} (上次: {_lastMediaTitle}, 身份变化: {identityChanged}, 强制hash: {forceHashCheck})");
 
             if (info.ThumbnailStream is Windows.Storage.Streams.IRandomAccessStreamReference thumbnailRef)
             {
@@ -377,7 +381,22 @@ namespace upper
 
                 // PC 播放状态变化时，与下位机 believed state 对比，只在需要切换时发送 topic。
                 // 下位机把 /1 和 /0 都当作切换命令，重复发送会导致摇臂反向运动。
-                SyncPlaybackStatusToLowerMachine();
+                //
+                // 注意（3.7 修复）：v2 固件下 Changing/Opened 等瞬态不参与同步。
+                // 网易云切歌会经过 Changing 瞬态，若据此发"暂停"toggle、Playing 时再发"播放"toggle，
+                // 封面传输风暴中丢掉其中任意一个包，believed state 就与下位机永久失同步。
+                // v2 固件的转动恢复由"封面传输完成后无条件补发"承担（HandleImageTransferAck），
+                // 不再依赖这对意外 toggle，因此瞬态可以安全跳过。
+                // v1 固件没有能力安全恢复转动，保留 legacy 行为（瞬态驱动同步），与 v1.1.0 一致。
+                // Stopped/Closed/NoSession 是确定态（播放器停止/关闭），仍需同步为暂停让摇臂归位。
+                if ((e.State == "Changing" || e.State == "Opened") && _firmwareSupportsIdempotentPlayback)
+                {
+                    FileLogger.Log("Media", $"瞬态播放状态，跳过下位机同步: {e.State}");
+                }
+                else
+                {
+                    SyncPlaybackStatusToLowerMachine();
+                }
             });
         }
 
@@ -428,7 +447,12 @@ namespace upper
             // 发送 /1 或 /0 效果相同：都是让下位机切换状态的 topic
             if (_serialPortService.SendPlaybackStatus(pcPlaying))
             {
+                FileLogger.Log("Sync", $"发送播放状态 topic: {(pcPlaying ? "/1" : "/0")}（believed {_lowerMachinePlaying} → {pcPlaying}）");
                 _lowerMachinePlaying = pcPlaying;
+            }
+            else
+            {
+                FileLogger.Log("Sync", $"播放状态 topic 发送失败: {(pcPlaying ? "/1" : "/0")}");
             }
         }
 
@@ -449,7 +473,7 @@ namespace upper
                 var openTask = thumbnailRef.OpenReadAsync().AsTask();
                 if (await Task.WhenAny(openTask, Task.Delay(3000)) != openTask)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[Media] 缩略图读取超时(3s)，跳过: {title}");
+                    FileLogger.Log("Media", $"缩略图读取超时(3s)，跳过: {title}");
                     await Dispatcher.InvokeAsync(() =>
                     {
                         ImageTransferStatusText.Text = "缩略图读取超时，跳过本次封面处理";
@@ -475,6 +499,7 @@ namespace upper
                     if (newHash == _lastImageHash)
                     {
                         // 图片 hash 未变化，说明是同一封面，直接返回。
+                        FileLogger.Log("Media", $"缩略图 hash 未变化，跳过: {title}");
                         return;
                     }
 
@@ -529,8 +554,8 @@ namespace upper
                     // 启动图片传输状态机
                     StartImageTransfer(rgb565Data);
 
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[Media] 封面处理完成，耗时 {sw.ElapsedMilliseconds}ms: {title}");
+                    FileLogger.Log("Media",
+                        $"封面处理完成，耗时 {sw.ElapsedMilliseconds}ms: {title}");
                 }
             }
             catch (Exception ex)
@@ -640,6 +665,12 @@ namespace upper
                 {
                     _statusSendTimer.Start();
                     _autoReconnectTimer.IsEnabled = false; // 连接成功时关闭自动重连
+
+                    // 协议版本协商：v2 固件回复 /v2（/1 /0 幂等设态）；v1 固件静默忽略。
+                    // 必须先复位标志再查询，避免上一次连接的协商结果残留。
+                    _firmwareSupportsIdempotentPlayback = false;
+                    _serialPortService.SendString("/v");
+                    FileLogger.Log("Serial", "已发送协议版本查询 /v");
 
                     // 重连后如果已有封面数据，执行更充分的握手序列再同步
                     if (_currentImageRgb565Data != null)
@@ -768,6 +799,12 @@ namespace upper
                     HandleImageTransferReady();
                     break;
 
+                case "/v":
+                    // 固件协议版本应答（/v2）：/1 /0 为幂等设态，封面传输完成后可无条件补发播放状态恢复转动
+                    _firmwareSupportsIdempotentPlayback = true;
+                    FileLogger.Log("Serial", "固件协议 v2：启用幂等设态播放命令");
+                    break;
+
                 case "/a":
                     // 下位机成功接收所有包
                     HandleImageTransferAck();
@@ -808,6 +845,7 @@ namespace upper
                     _pendingImageData = null;
                     _imageTransferCts = new CancellationTokenSource();
                     // _imagePhase 保持 Starting
+                    FileLogger.Log("Transfer", $"上一张图仍在等 /k，直接替换为新图 (transfer {currentTransferId})");
                 }
                 // 如果正在传输中或等待 /a，先排队为 pending 并请求取消当前传输，
                 // 等当前传输自然结束（收到 /a 或超时）后再启动新传输，
@@ -816,6 +854,7 @@ namespace upper
                 {
                     _pendingImageData = imageData;
                     _imageTransferCts?.Cancel();
+                    FileLogger.Log("Transfer", $"当前处于 {_imagePhase}，新图排队为 pending 并取消当前传输");
                     return;
                 }
                 else
@@ -826,6 +865,7 @@ namespace upper
                     _pendingImageData = null;
                     _imagePhase = ImageTransferPhase.Starting;
                     _imageTransferCts = new CancellationTokenSource();
+                    FileLogger.Log("Transfer", $"启动图片传输 (transfer {currentTransferId}, {imageData.Length} 字节)");
                 }
             }
 
@@ -946,6 +986,7 @@ namespace upper
 
                 if (pending != null)
                 {
+                    FileLogger.Log("Transfer", "传输被取消，300ms 后启动 pending 新图");
                     // 稍等片刻再启动新图，给下位机状态机留出过渡时间
                     _ = Task.Delay(300).ContinueWith(_ =>
                     {
@@ -988,12 +1029,37 @@ namespace upper
             }
 
             ImageTransferStatusText.Text = "✅ 收到 /a，图片发送完成";
-            System.Diagnostics.Debug.WriteLine(
-                $"[Transfer] /t→/a 耗时 {(DateTime.Now - _transferStartTime).TotalMilliseconds:F0}ms");
+            FileLogger.Log("Transfer",
+                $"/t→/a 耗时 {(DateTime.Now - _transferStartTime).TotalMilliseconds:F0}ms");
 
-            // 图片到位后同步当前播放状态，确保摇臂位置与 PC 一致，
-            // 但只在 PC 状态与下位机 believed state 不一致时才发送 topic，避免误切换。
-            SyncPlaybackStatusToLowerMachine();
+            // 图片到位后同步当前播放状态。
+            // v2 固件（幂等设态）：/t 会暂停下位机转动，而只有 /1 能恢复——
+            // 网易云等播放器切歌全程保持 Playing，believed 无变化、同步逻辑不会发 /1，
+            // 转盘就会永久停转（3.7 根因）。因此 v2 下无条件补发一次当前播放状态，
+            // 延迟 1000ms 避开下落动画（disp_pic_rotate 会打断动画）。
+            // v1 固件：无条件发送会翻转摇臂，保持 legacy 的不一致才发。
+            if (_firmwareSupportsIdempotentPlayback)
+            {
+                _ = Task.Delay(1000).ContinueWith(_ =>
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        if (!_serialPortService.IsConnected) return;
+                        bool pcPlaying = _currentPlayStatus == "Playing";
+                        if (_serialPortService.SendPlaybackStatus(pcPlaying))
+                        {
+                            FileLogger.Log("Sync", $"封面传输完成，无条件补发播放状态（v2 幂等）: {(pcPlaying ? "/1" : "/0")}");
+                            _lowerMachinePlaying = pcPlaying;
+                        }
+                    });
+                });
+            }
+            else
+            {
+                // 图片到位后同步当前播放状态，确保摇臂位置与 PC 一致，
+                // 但只在 PC 状态与下位机 believed state 不一致时才发送 topic，避免误切换。
+                SyncPlaybackStatusToLowerMachine();
+            }
 
             if (pending != null)
             {
@@ -1049,6 +1115,7 @@ namespace upper
 
                 _imagePhase = ImageTransferPhase.Idle;
                 ImageTransferStatusText.Text = $"图片传输超时: {expectedPhase}";
+                FileLogger.Log("Transfer", $"图片传输超时: {expectedPhase}（耗时 {(DateTime.Now - _transferStartTime).TotalMilliseconds:F0}ms）");
                 pending = _pendingImageData;
                 _pendingImageData = null;
                 autoRetry = _autoRetryOnAckTimeout;

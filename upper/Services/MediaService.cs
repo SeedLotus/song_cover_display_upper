@@ -97,6 +97,8 @@ namespace upper.Services
                     newSession.MediaPropertiesChanged += OnMediaPropertiesChanged;
                     newSession.PlaybackInfoChanged += OnPlaybackInfoChanged;
 
+                    FileLogger.Log("SMTC", $"会话切换: {newSession.SourceAppUserModelId}");
+
                     // 立即获取一次当前信息
                     await UpdateMediaInfoAsync();
                     await UpdatePlaybackInfoAsync();
@@ -173,10 +175,12 @@ namespace upper.Services
                     if (sender != _currentSession)
                     {
                         // 如果不是当前会话的事件，忽略
+                        FileLogger.Log("SMTC", "MediaPropertiesChanged 来自非当前会话，已忽略");
                         return;
                     }
                 }
 
+                FileLogger.Log("SMTC", "MediaPropertiesChanged 事件触发");
                 await UpdateMediaInfoAsync();
             }
             catch (Exception ex)
@@ -199,11 +203,12 @@ namespace upper.Services
                     if (sender != _currentSession)
                     {
                         // 如果不是当前会话的事件，忽略
+                        FileLogger.Log("SMTC", "PlaybackInfoChanged 来自非当前会话，已忽略");
                         return;
                     }
                 }
 
-                await UpdatePlaybackInfoAsync();
+                await UpdatePlaybackInfoAsync(logEvent: true);
             }
             catch (Exception ex)
             {
@@ -248,7 +253,7 @@ namespace upper.Services
         /// <summary>
         /// 更新播放状态并触发事件（GetPlaybackInfo 为同步 API，方法本身无异步操作）
         /// </summary>
-        private Task UpdatePlaybackInfoAsync()
+        private Task UpdatePlaybackInfoAsync(bool logEvent = false)
         {
             GlobalSystemMediaTransportControlsSession? currentSession;
 
@@ -263,6 +268,11 @@ namespace upper.Services
             {
                 var playbackInfo = currentSession.GetPlaybackInfo();
                 string state = playbackInfo.PlaybackStatus.ToString();
+
+                if (logEvent)
+                {
+                    FileLogger.Log("SMTC", $"PlaybackInfoChanged 事件: {state}");
+                }
 
                 OnPlaybackStateChanged(state);
             }

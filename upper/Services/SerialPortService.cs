@@ -945,6 +945,11 @@ namespace upper.Services
         protected virtual void OnStatusMessage(string message)
         {
             System.Diagnostics.Debug.WriteLine($"[Serial] {DateTime.Now:HH:mm:ss.fff} {message}");
+            // 心跳每秒一次，写入文件会刷屏，过滤掉；其余串口消息全量入文件日志
+            if (!message.StartsWith("已发送: /h", StringComparison.Ordinal))
+            {
+                FileLogger.Log("Serial", message);
+            }
             StatusMessage?.Invoke(this, message);
         }
 
