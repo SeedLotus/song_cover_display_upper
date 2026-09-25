@@ -73,6 +73,9 @@ namespace upper
 
         // 媒体事件防抖：SMTC 事件触发瞬间属性可能仍是上一个媒体的，需延迟后主动重取
         private CancellationTokenSource? _mediaDebounceCts;
+        // 播放指令合并防抖：网易云重建 SMTC 会话会报出 50ms 级状态抖动，只发最终稳定状态
+        private CancellationTokenSource? _playbackSyncDebounceCts;
+        private const int PlaybackSyncDebounceMs = 200;
         // 两段式拉取：120ms 首次拉取（尽快出图），500ms 确认拉取（兜住 SMTC 滞后更新）
         private static readonly TimeSpan MediaFirstFetchDelay = TimeSpan.FromMilliseconds(120);
         private static readonly TimeSpan MediaConfirmFetchDelay = TimeSpan.FromMilliseconds(500);
@@ -500,7 +503,18 @@ namespace upper
                 }
                 else
                 {
-                    SyncPlaybackStatusToLowerMachine();
+                    // 网易云播放/暂停会重建 SMTC 会话，新会话初始化瞬间报出过时状态，
+                    // 造成 Paused→Playing→Paused 的 50ms 级抖动（2026-09-25 实机日志证实，
+                    // 是 2.18 摇臂"错乱/误动作"的真正来源）。200ms 合并防抖：只发最终稳定状态，
+                    // UI 仍即时更新，摇臂动作延迟 200ms 可接受。
+                    _playbackSyncDebounceCts?.Cancel();
+                    _playbackSyncDebounceCts = new CancellationTokenSource();
+                    var token = _playbackSyncDebounceCts.Token;
+                    _ = Task.Delay(PlaybackSyncDebounceMs, token).ContinueWith(t =>
+                    {
+                        if (t.IsCanceled) return;
+                        Dispatcher.Invoke(SyncPlaybackStatusToLowerMachine);
+                    });
                 }
             });
         }
@@ -1163,35 +1177,14 @@ namespace upper
             FileLogger.Log("Transfer",
                 $"/t→/a 耗时 {(DateTime.Now - _transferStartTime).TotalMilliseconds:F0}ms");
 
-            // 图片到位后同步当前播放状态。
-            // 固件 /t 会暂停下位机转动，而只有 /1 能恢复——网易云等播放器切歌全程保持 Playing，
-            // believed 无变化、同步逻辑不会发 /1，转盘就会永久停转（3.7 根因）。
-            // 两种已确认安全的情形下，无条件补发一次当前播放状态恢复转动：
-            //   1. v2 固件（/v 协商，/1 /0 幂等设态）；
-            //   2. v1 固件但经「检测转动恢复」探测确认为设态语义（重复 /1 无副作用）。
-            // 延迟 1000ms 避开下落动画（disp_pic_rotate 会打断动画）。
-            // 未探测/翻转语义：无条件发送有翻臂风险，保持 legacy 的不一致才发。
-            if (_firmwareSupportsIdempotentPlayback || _appSettings.FirmwareSemantics == "SetState")
+            // 图片到位后恢复转盘转动（安全条件判据在方法内）。
+            ScheduleRotationRestoreAfterTransfer("收到 /a");
+
+            // 图片到位后同步当前播放状态，确保摇臂位置与 PC 一致，
+            // 但只在 PC 状态与下位机 believed state 不一致时才发送 topic，避免误切换。
+            // （恢复转动已确认安全时，该补发由 ScheduleRotationRestoreAfterTransfer 承担）
+            if (!_firmwareSupportsIdempotentPlayback && _appSettings.FirmwareSemantics != "SetState")
             {
-                _ = Task.Delay(1000).ContinueWith(_ =>
-                {
-                    Dispatcher.Invoke(() =>
-                    {
-                        if (!_serialPortService.IsConnected) return;
-                        bool pcPlaying = _currentPlayStatus == "Playing";
-                        if (_serialPortService.SendPlaybackStatus(pcPlaying))
-                        {
-                            FileLogger.Log("Sync",
-                                $"封面传输完成，无条件补发播放状态（{(_firmwareSupportsIdempotentPlayback ? "v2 协商" : "探测设态")}）: {(pcPlaying ? "/1" : "/0")}");
-                            _lowerMachinePlaying = pcPlaying;
-                        }
-                    });
-                });
-            }
-            else
-            {
-                // 图片到位后同步当前播放状态，确保摇臂位置与 PC 一致，
-                // 但只在 PC 状态与下位机 believed state 不一致时才发送 topic，避免误切换。
                 SyncPlaybackStatusToLowerMachine();
             }
 
@@ -1210,6 +1203,47 @@ namespace upper
                     _imagePhase = ImageTransferPhase.Idle;
                 }
             }
+        }
+
+        // 封面传输结束（收到 /a，或 AwaitingAck 超时但下位机多半已显示封面）后恢复转盘转动。
+        // 背景：固件 /t 会停转，而只有 /1 能恢复；网易云切歌全程 Playing，believed 无变化，
+        // believed-state 同步永远不会发恢复 /1（3.7 根因）。因此这里无条件补发一次当前播放状态。
+        // 安全前提（二者其一）：v2 固件（/v 协商，幂等设态）；或 v1 固件经「检测转动恢复」
+        // 探测确认为设态语义（重复 /1 无副作用）。未满足时直接返回，保持 legacy 行为。
+        // 延迟 1000ms 避开下落动画；若到时仍有接力传输在进行，顺延最多约 3 秒，
+        // 避免 /1 插进图片包流。
+        private void ScheduleRotationRestoreAfterTransfer(string trigger)
+        {
+            if (!_firmwareSupportsIdempotentPlayback && _appSettings.FirmwareSemantics != "SetState")
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(1000);
+
+                for (int i = 0; i < 6; i++)
+                {
+                    bool busy;
+                    lock (_imageTransferLock)
+                    {
+                        busy = _imagePhase != ImageTransferPhase.Idle && _imagePhase != ImageTransferPhase.Completed;
+                    }
+                    if (!busy) break;
+                    await Task.Delay(500);
+                }
+
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    if (!_serialPortService.IsConnected) return;
+                    bool pcPlaying = _currentPlayStatus == "Playing";
+                    if (_serialPortService.SendPlaybackStatus(pcPlaying))
+                    {
+                        FileLogger.Log("Sync",
+                            $"传输结束补发播放状态（{trigger}，{(_firmwareSupportsIdempotentPlayback ? "v2 协商" : "探测设态")}）: {(pcPlaying ? "/1" : "/0")}");
+                        _lowerMachinePlaying = pcPlaying;
+                    }
+                });
+            });
         }
 
         // 传输阶段超时处理
@@ -1255,6 +1289,13 @@ namespace upper
                 autoRetry = _autoRetryOnAckTimeout;
                 _autoRetryOnAckTimeout = false;
                 currentImage = _currentImageRgb565Data;
+            }
+
+            // AwaitingAck 超时多半只是 /a 丢失（3.4：下位机实际已显示封面并播了动画），
+            // /t 造成的停转同样需要恢复
+            if (expectedPhase == ImageTransferPhase.AwaitingAck)
+            {
+                ScheduleRotationRestoreAfterTransfer("/a 超时");
             }
 
             // 重连后首次封面同步 /a 超时，自动重试一次完整传输
