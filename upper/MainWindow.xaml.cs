@@ -136,6 +136,11 @@ namespace upper
 
         private void UpdateFirmwareSemanticsText()
         {
+            // 探测按钮只在未探测（Unknown）时显示：settings.json 是便携模式跟随 exe 目录的，
+            // 每个新部署目录首次运行都需要探测一次；探测过就隐藏，保持界面干净。
+            ProbeFirmwareButton.Visibility = _appSettings.FirmwareSemantics == "Unknown"
+                ? Visibility.Visible : Visibility.Collapsed;
+
             FirmwareSemanticsText.Text = _appSettings.FirmwareSemantics switch
             {
                 "SetState" => "转动恢复：已启用（设态固件）",
