@@ -14,6 +14,13 @@ namespace upper.Services
         /// </summary>
         public bool SilentStart { get; set; } = false;
 
+        /// <summary>
+        /// 固件播放指令语义探测结果：Unknown（未探测）/ SetState（设态，重复指令无副作用）/
+        /// Toggle（翻转，重复指令会反向）。由主界面「检测转动恢复」按钮探测写入。
+        /// SetState 时启用"真实切歌传输完成后补发 /1 恢复转动"。
+        /// </summary>
+        public string FirmwareSemantics { get; set; } = "Unknown";
+
         private static string SettingsFilePath =>
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
 

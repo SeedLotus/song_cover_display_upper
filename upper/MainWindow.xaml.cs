@@ -111,8 +111,112 @@ namespace upper
             // 初始化静默启动复选框状态（赋值会触发 Changed 事件，但值与磁盘一致，重复保存无害）
             SilentStartCheckBox.IsChecked = _appSettings.SilentStart;
 
+            // 显示固件语义探测结果（转动恢复能力）
+            UpdateFirmwareSemanticsText();
+
             // 启动时尝试自动连接设备
             AutoConnectDevice();
+        }
+
+        // ==================== 固件语义探测（转动恢复能力） ====================
+        // 背景：v1 固件下恢复转盘转动只能发 /1，但设备实际固件对"重复 /1"是设态（无副作用）
+        // 还是翻转（摇臂反向）无法在线验证（fork 源码与 2.18 实机记录矛盾）。
+        // 探测原理：在 believed=暂停（摇臂抬起）时发一个重复的 /0——
+        //   设态固件：暂停态收到暂停指令，摇臂无任何动作；
+        //   翻转固件：状态被翻转为播放，摇臂开始放下（肉眼可见）。
+        // 用户观察 10 秒回答二值结果，持久化到 settings.json，一次探测永久有效。
+        private bool _probeRunning = false;
+
+        private void UpdateFirmwareSemanticsText()
+        {
+            FirmwareSemanticsText.Text = _appSettings.FirmwareSemantics switch
+            {
+                "SetState" => "转动恢复：已启用（设态固件）",
+                "Toggle" => "转动恢复：不支持（翻转固件）",
+                _ => "转动恢复：未检测"
+            };
+        }
+
+        private async void ProbeFirmwareButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_probeRunning) return;
+
+            if (!_serialPortService.IsConnected)
+            {
+                System.Windows.MessageBox.Show("请先连接设备再检测。", "无法检测", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Warning);
+                return;
+            }
+
+            lock (_imageTransferLock)
+            {
+                if (_imagePhase != ImageTransferPhase.Idle && _imagePhase != ImageTransferPhase.Completed)
+                {
+                    System.Windows.MessageBox.Show("当前正在传输封面，请等待传输完成后再检测。", "无法检测",
+                        System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Warning);
+                    return;
+                }
+            }
+
+            // 探测前提是设备确信处于暂停态（摇臂抬起）。believed=播放时发 /0 在设态固件下
+            // 是合法的暂停指令（摇臂会抬起），会被误判为翻转，因此必须先让摇臂抬起。
+            if (_lowerMachinePlaying)
+            {
+                System.Windows.MessageBox.Show("请先暂停音乐，待摇臂抬起后再开始检测。", "无法检测",
+                    System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Warning);
+                return;
+            }
+
+            var confirm = System.Windows.MessageBox.Show(
+                "检测步骤：\n" +
+                "1. 保持音乐处于暂停状态，检测期间请勿操作播放器；\n" +
+                "2. 确认摇臂处于抬起位置；\n" +
+                "3. 点击「确定」后将发送一条探测指令，请观察摇臂约 10 秒。\n\n" +
+                "准备好后开始检测。",
+                "转动恢复兼容性检测", System.Windows.MessageBoxButton.OKCancel, System.Windows.MessageBoxImage.Information);
+            if (confirm != System.Windows.MessageBoxResult.OK) return;
+
+            _probeRunning = true;
+            ProbeFirmwareButton.IsEnabled = false;
+            try
+            {
+                // believed=暂停时发送重复 /0：设态固件无反应，翻转固件会开始放下摇臂
+                FileLogger.Log("Probe", "发送探测指令（重复 /0），开始 10 秒观察窗口");
+                _serialPortService.SendPlaybackStatus(false);
+                ImageTransferStatusText.Text = "探测指令已发送，请观察摇臂 10 秒...";
+                await Task.Delay(10000);
+
+                var moved = System.Windows.MessageBox.Show("过去 10 秒内，摇臂是否有动作？",
+                    "检测结果确认", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Question);
+
+                if (moved == System.Windows.MessageBoxResult.Yes)
+                {
+                    // 翻转语义：状态被翻成了播放，再发 /0 翻回暂停，恢复摇臂位置
+                    _serialPortService.SendPlaybackStatus(false);
+                    _lowerMachinePlaying = false;
+                    _appSettings.FirmwareSemantics = "Toggle";
+                    FileLogger.Log("Probe", "用户确认摇臂有动作 → 翻转语义，已发 /0 翻回暂停");
+                    System.Windows.MessageBox.Show(
+                        "检测结果：翻转语义固件。\n已自动恢复摇臂位置。\n\n" +
+                        "真实切歌后的自动转动恢复无法启用（需日后烧录 v2 固件解决）。",
+                        "检测完成", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
+                }
+                else
+                {
+                    _appSettings.FirmwareSemantics = "SetState";
+                    FileLogger.Log("Probe", "用户确认摇臂无动作 → 设态语义，启用切歌后自动恢复转动");
+                    System.Windows.MessageBox.Show(
+                        "检测结果：设态语义固件。\n已启用「真实切歌后自动恢复转动」，立即生效。",
+                        "检测完成", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
+                }
+
+                _appSettings.Save();
+                UpdateFirmwareSemanticsText();
+            }
+            finally
+            {
+                _probeRunning = false;
+                ProbeFirmwareButton.IsEnabled = true;
+            }
         }
 
     // ==================== 服务初始化 ====================
@@ -653,8 +757,8 @@ namespace upper
                     // 显示错误消息
                     System.Windows.MessageBox.Show(errorMessage + $"\n\n请手动访问: {url}",
                         "浏览器打开失败",
-                        MessageBoxButton.OK,
-                        MessageBoxImage.Warning);
+                        System.Windows.MessageBoxButton.OK,
+                        System.Windows.MessageBoxImage.Warning);
 
                     // 尝试复制URL到剪贴板，方便用户手动粘贴
                     try
@@ -1060,12 +1164,14 @@ namespace upper
                 $"/t→/a 耗时 {(DateTime.Now - _transferStartTime).TotalMilliseconds:F0}ms");
 
             // 图片到位后同步当前播放状态。
-            // v2 固件（幂等设态）：/t 会暂停下位机转动，而只有 /1 能恢复——
-            // 网易云等播放器切歌全程保持 Playing，believed 无变化、同步逻辑不会发 /1，
-            // 转盘就会永久停转（3.7 根因）。因此 v2 下无条件补发一次当前播放状态，
+            // 固件 /t 会暂停下位机转动，而只有 /1 能恢复——网易云等播放器切歌全程保持 Playing，
+            // believed 无变化、同步逻辑不会发 /1，转盘就会永久停转（3.7 根因）。
+            // 两种已确认安全的情形下，无条件补发一次当前播放状态恢复转动：
+            //   1. v2 固件（/v 协商，/1 /0 幂等设态）；
+            //   2. v1 固件但经「检测转动恢复」探测确认为设态语义（重复 /1 无副作用）。
             // 延迟 1000ms 避开下落动画（disp_pic_rotate 会打断动画）。
-            // v1 固件：无条件发送会翻转摇臂，保持 legacy 的不一致才发。
-            if (_firmwareSupportsIdempotentPlayback)
+            // 未探测/翻转语义：无条件发送有翻臂风险，保持 legacy 的不一致才发。
+            if (_firmwareSupportsIdempotentPlayback || _appSettings.FirmwareSemantics == "SetState")
             {
                 _ = Task.Delay(1000).ContinueWith(_ =>
                 {
@@ -1075,7 +1181,8 @@ namespace upper
                         bool pcPlaying = _currentPlayStatus == "Playing";
                         if (_serialPortService.SendPlaybackStatus(pcPlaying))
                         {
-                            FileLogger.Log("Sync", $"封面传输完成，无条件补发播放状态（v2 幂等）: {(pcPlaying ? "/1" : "/0")}");
+                            FileLogger.Log("Sync",
+                                $"封面传输完成，无条件补发播放状态（{(_firmwareSupportsIdempotentPlayback ? "v2 协商" : "探测设态")}）: {(pcPlaying ? "/1" : "/0")}");
                             _lowerMachinePlaying = pcPlaying;
                         }
                     });
@@ -1457,8 +1564,8 @@ namespace upper
                         //System.Windows.MessageBox.Show("开机自启动已启用。\n\n启动文件夹: " +
                         //    _autoStartManager.GetStartupFolderDisplayPath(),
                         //    "设置成功",
-                        //    MessageBoxButton.OK,
-                        //    MessageBoxImage.Information);
+                        //    System.Windows.MessageBoxButton.OK,
+                        //    System.Windows.MessageBoxImage.Information);
                     }
                 }
                 else
@@ -1482,8 +1589,8 @@ namespace upper
 
                 System.Windows.MessageBox.Show($"设置开机自启动失败:\n\n{ex.Message}",
                     "设置失败",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error);
+                    System.Windows.MessageBoxButton.OK,
+                    System.Windows.MessageBoxImage.Error);
             }
 
             // 同步托盘菜单勾选状态（失败回滚后也会走到这里，保证托盘与复选框一致）
