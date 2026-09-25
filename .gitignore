@@ -364,5 +364,5 @@ FodyWeavers.xsd
 
 # Local temporary firmware clone used for protocol analysis
 _firmware_temp/
-# Local release publish output
-publish-v*/
+# Local release publish output (publish/<version>/, already covered by the publish/ rule above;
+# kept as a reminder that publish/ holds local release artifacts and must never be committed)
