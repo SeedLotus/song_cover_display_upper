@@ -31,6 +31,7 @@ namespace upper
         private string? _currentPlayStatus;           // 当前播放状态
         private byte[]? _currentImageRgb565Data;      // 当前图片的RGB565编码数据
         private string? _lastImageHash;               // 上次图片哈希（用于变化检测）
+        private ulong? _lastPerceptualHash;           // 下位机实际显示封面的感知哈希（变体去重）
         private string _lastMediaTitle = string.Empty;   // 上次媒体标题（用于播放/暂停去重）
         private string _lastMediaArtist = string.Empty;  // 上次媒体艺术家
         private string _lastMediaAlbum = string.Empty;   // 上次媒体专辑
@@ -503,11 +504,36 @@ namespace upper
                         return;
                     }
 
+                    // 感知哈希兜底：MD5 不同不代表封面不同——网易云播放/暂停时会推送
+                    // 同一封面的不同分辨率/编码变体（3.7：每次播放/暂停都触发一次完整传输
+                    // + 下滑动画 + /t 停转）。视觉上同一张图（含同专辑不同曲目）不重传：
+                    // 下位机已经显示着这张封面，重传只会白白停转+播动画。
+                    const int PerceptualHashThreshold = 8; // 64 位中允许的差异位数
+                    ulong newPerceptualHash = ImageProcessor.ComputePerceptualHash(originalBitmap);
+                    if (_lastPerceptualHash.HasValue)
+                    {
+                        int distance = ImageProcessor.HammingDistance(newPerceptualHash, _lastPerceptualHash.Value);
+                        if (distance <= PerceptualHashThreshold)
+                        {
+                            // 身份照常更新（避免后续事件的身份判断停留在旧曲目），
+                            // 但 _lastImageHash/_lastPerceptualHash 不动——它们代表下位机
+                            // 实际显示的封面，跳过的变体不应成为新的比对基准。
+                            _lastMediaTitle = title;
+                            _lastMediaArtist = artist;
+                            _lastMediaAlbum = album;
+                            FileLogger.Log("Media",
+                                $"感知哈希相同（距离 {distance}），判定为同一封面变体，跳过重传: {title}");
+                            return;
+                        }
+                        FileLogger.Log("Media", $"感知哈希距离 {distance}，确认为新封面: {title}");
+                    }
+
                     // 真正的新封面：立即更新媒体身份与 hash，这样后续重复/滞后事件能正确判断。
                     _lastMediaTitle = title;
                     _lastMediaArtist = artist;
                     _lastMediaAlbum = album;
                     _lastImageHash = newHash;
+                    _lastPerceptualHash = newPerceptualHash;
 
                     // 处理图片（智能缩放 + 模糊背景），使用后台优先级减少 UI 卡顿
                     var processedImage = await Dispatcher.InvokeAsync(
@@ -565,6 +591,7 @@ namespace upper
                     AlbumArtImage.Source = ImageProcessor.CreatePlaceholderImage();
                     _currentImageRgb565Data = null;
                     _lastImageHash = null;
+                    _lastPerceptualHash = null;
                     ImageTransferStatusText.Text = $"封面处理失败: {ex.Message}";
                 });
             }

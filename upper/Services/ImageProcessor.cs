@@ -202,6 +202,51 @@ namespace upper.Services
         }
 
         /// <summary>
+        /// 计算 64 位感知哈希（aHash）：缩放到 8x8 灰度后与均值比较。
+        /// 用于识别"视觉上同一张封面"——同一图片的不同分辨率/编码变体（如网易云播放/暂停时
+        /// 推送的缩略图变体）MD5 完全不同但感知哈希几乎一致，可避免不必要的封面重传。
+        /// 调用方需保证 image 已 Freeze 且在 UI 线程调用。
+        /// </summary>
+        public static ulong ComputePerceptualHash(BitmapSource image)
+        {
+            if (image == null || image.PixelWidth <= 0 || image.PixelHeight <= 0) return 0;
+
+            // 缩放到 8x8 并转灰度
+            var scaled = new TransformedBitmap(image,
+                new ScaleTransform(8.0 / image.PixelWidth, 8.0 / image.PixelHeight));
+            var gray = new FormatConvertedBitmap(scaled, PixelFormats.Gray8, null, 0);
+
+            byte[] pixels = new byte[64];
+            gray.CopyPixels(pixels, 8, 0);
+
+            int sum = 0;
+            for (int i = 0; i < 64; i++) sum += pixels[i];
+            int avg = sum / 64;
+
+            ulong hash = 0;
+            for (int i = 0; i < 64; i++)
+            {
+                if (pixels[i] >= avg) hash |= 1UL << i;
+            }
+            return hash;
+        }
+
+        /// <summary>
+        /// 两个感知哈希的汉明距离（0-64，越小越相似）
+        /// </summary>
+        public static int HammingDistance(ulong a, ulong b)
+        {
+            ulong x = a ^ b;
+            int count = 0;
+            while (x != 0)
+            {
+                count += (int)(x & 1);
+                x >>= 1;
+            }
+            return count;
+        }
+
+        /// <summary>
         /// 计算图像的MD5哈希值（用于检测图片是否变化）
         /// </summary>
         public static string ComputeImageHash(BitmapSource image)
