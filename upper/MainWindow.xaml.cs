@@ -73,9 +73,13 @@ namespace upper
 
         // 媒体事件防抖：SMTC 事件触发瞬间属性可能仍是上一个媒体的，需延迟后主动重取
         private CancellationTokenSource? _mediaDebounceCts;
-        // 播放指令合并防抖：网易云重建 SMTC 会话会报出 50ms 级状态抖动，只发最终稳定状态
+        // 播放指令自适应防抖：网易云重建 SMTC 会话会报出 50ms 级状态抖动。
+        // 距上次发 topic 超过 QuietMs 视为真实操作 → 立即发（0 延迟）；
+        // QuietMs 窗口内的连续变化按抖动处理 → 150ms 合并后只发终态。
         private CancellationTokenSource? _playbackSyncDebounceCts;
-        private const int PlaybackSyncDebounceMs = 200;
+        private DateTime _lastPlaybackTopicSentAt = DateTime.MinValue;
+        private const int PlaybackTopicQuietMs = 500;
+        private const int PlaybackSyncDebounceMs = 150;
         // 两段式拉取：120ms 首次拉取（尽快出图），500ms 确认拉取（兜住 SMTC 滞后更新）
         private static readonly TimeSpan MediaFirstFetchDelay = TimeSpan.FromMilliseconds(120);
         private static readonly TimeSpan MediaConfirmFetchDelay = TimeSpan.FromMilliseconds(500);
@@ -505,12 +509,15 @@ namespace upper
                 {
                     // 网易云播放/暂停会重建 SMTC 会话，新会话初始化瞬间报出过时状态，
                     // 造成 Paused→Playing→Paused 的 50ms 级抖动（2026-09-25 实机日志证实，
-                    // 是 2.18 摇臂"错乱/误动作"的真正来源）。200ms 合并防抖：只发最终稳定状态，
-                    // UI 仍即时更新，摇臂动作延迟 200ms 可接受。
+                    // 是 2.18 摇臂"错乱/误动作"的真正来源）。自适应防抖：
+                    // 距上次发 topic 超过 500ms = 真实操作，立即同步（摇臂即时响应）；
+                    // 500ms 窗口内的连续变化 = 抖动，150ms 合并后只发最终稳定状态。
+                    int syncDelay = (DateTime.Now - _lastPlaybackTopicSentAt).TotalMilliseconds > PlaybackTopicQuietMs
+                        ? 0 : PlaybackSyncDebounceMs;
                     _playbackSyncDebounceCts?.Cancel();
                     _playbackSyncDebounceCts = new CancellationTokenSource();
                     var token = _playbackSyncDebounceCts.Token;
-                    _ = Task.Delay(PlaybackSyncDebounceMs, token).ContinueWith(t =>
+                    _ = Task.Delay(syncDelay, token).ContinueWith(t =>
                     {
                         if (t.IsCanceled) return;
                         Dispatcher.Invoke(SyncPlaybackStatusToLowerMachine);
@@ -568,6 +575,7 @@ namespace upper
             {
                 FileLogger.Log("Sync", $"发送播放状态 topic: {(pcPlaying ? "/1" : "/0")}（believed {_lowerMachinePlaying} → {pcPlaying}）");
                 _lowerMachinePlaying = pcPlaying;
+                _lastPlaybackTopicSentAt = DateTime.Now;
             }
             else
             {
@@ -973,7 +981,9 @@ namespace upper
         // ==================== 图片传输状态机 ====================
 
         // 启动一次新的图片传输
-        private void StartImageTransfer(byte[] imageData, int kRetryCount = 2, int kRetryIntervalMs = 150)
+        // /k 等待：v1 设备的 /k 回复 100% 丢失（与 /a 同源），默认只等 1×100ms+100ms 兜底，
+        // 避免每次封面传输白等 500ms；重连场景仍用长重试（ReconnectKRetryCount）。
+        private void StartImageTransfer(byte[] imageData, int kRetryCount = 1, int kRetryIntervalMs = 100)
         {
             ulong currentTransferId;
 
@@ -1109,8 +1119,13 @@ namespace upper
 
                 _serialPortService.SendImageEndCommand();
 
-                // 1000ms 内未收到 /a 则超时；不再重试 /o，避免下位机重复播放下落动画。
-                _ = WaitForPhaseTimeoutAsync(transferId, ImageTransferPhase.AwaitingAck, 1000);
+                // /o 一发出就调度转动恢复（延迟 700ms 覆盖下落动画）。
+                // v1 设备 /a 100% 丢失，不能等 /a 或超时再恢复——那是 2 秒起步的延迟。
+                ScheduleRotationRestoreAfterTransfer(transferId, "/o 已发");
+
+                // 600ms 内未收到 /a 则超时（v1 必超，仅作状态机复位与恢复兜底）；
+                // 不再重试 /o，避免下位机重复播放下落动画。
+                _ = WaitForPhaseTimeoutAsync(transferId, ImageTransferPhase.AwaitingAck, 600);
             }
             catch (OperationCanceledException)
             {
@@ -1177,8 +1192,8 @@ namespace upper
             FileLogger.Log("Transfer",
                 $"/t→/a 耗时 {(DateTime.Now - _transferStartTime).TotalMilliseconds:F0}ms");
 
-            // 图片到位后恢复转盘转动（安全条件判据在方法内）。
-            ScheduleRotationRestoreAfterTransfer("收到 /a");
+            // 图片到位后恢复转盘转动（/o 发出时已调度，此处按 transferId 去重，正常不会重复触发）。
+            ScheduleRotationRestoreAfterTransfer(_transferId, "收到 /a");
 
             // 图片到位后同步当前播放状态，确保摇臂位置与 PC 一致，
             // 但只在 PC 状态与下位机 believed state 不一致时才发送 topic，避免误切换。
@@ -1205,21 +1220,32 @@ namespace upper
             }
         }
 
-        // 封面传输结束（收到 /a，或 AwaitingAck 超时但下位机多半已显示封面）后恢复转盘转动。
+        // 封面传输结束（/o 已发出即调度，不依赖 /a——v1 设备 /a 100% 丢失）后恢复转盘转动。
         // 背景：固件 /t 会停转，而只有 /1 能恢复；网易云切歌全程 Playing，believed 无变化，
         // believed-state 同步永远不会发恢复 /1（3.7 根因）。因此这里无条件补发一次当前播放状态。
         // 安全前提（二者其一）：v2 固件（/v 协商，幂等设态）；或 v1 固件经「检测转动恢复」
         // 探测确认为设态语义（重复 /1 无副作用）。未满足时直接返回，保持 legacy 行为。
-        // 延迟 1000ms 避开下落动画；若到时仍有接力传输在进行，顺延最多约 3 秒，
-        // 避免 /1 插进图片包流。
-        private void ScheduleRotationRestoreAfterTransfer(string trigger)
+        // 延迟 700ms 覆盖下落动画（disp_pic_rotate 会打断动画）；若到时仍有接力传输在进行，
+        // 顺延最多约 3 秒，避免 /1 插进图片包流。同一 transferId 只调度一次（/o、/a、超时
+        // 三个触发点去重）。
+        private ulong _rotationRestoreScheduledTransferId = 0;
+        private const int RotationRestoreDelayMs = 700;
+
+        private void ScheduleRotationRestoreAfterTransfer(ulong transferId, string trigger)
         {
             if (!_firmwareSupportsIdempotentPlayback && _appSettings.FirmwareSemantics != "SetState")
                 return;
 
+            lock (_imageTransferLock)
+            {
+                if (_rotationRestoreScheduledTransferId == transferId)
+                    return;
+                _rotationRestoreScheduledTransferId = transferId;
+            }
+
             _ = Task.Run(async () =>
             {
-                await Task.Delay(1000);
+                await Task.Delay(RotationRestoreDelayMs);
 
                 for (int i = 0; i < 6; i++)
                 {
@@ -1291,11 +1317,11 @@ namespace upper
                 currentImage = _currentImageRgb565Data;
             }
 
-            // AwaitingAck 超时多半只是 /a 丢失（3.4：下位机实际已显示封面并播了动画），
-            // /t 造成的停转同样需要恢复
+            // AwaitingAck 超时多半只是 /a 丢失（3.4：v1 设备 100% 丢失，下位机实际已显示封面），
+            // /o 发出时已调度恢复，此处仅作兜底（按 transferId 去重）
             if (expectedPhase == ImageTransferPhase.AwaitingAck)
             {
-                ScheduleRotationRestoreAfterTransfer("/a 超时");
+                ScheduleRotationRestoreAfterTransfer(transferId, "/a 超时");
             }
 
             // 重连后首次封面同步 /a 超时，自动重试一次完整传输
@@ -1341,10 +1367,11 @@ namespace upper
                 _serialPortService.SendImageStartCommand();
             }
 
-            // 最后一次重试后再等 200ms，若仍未收到 /k 则直接发图
+            // 最后一次重试后再等 100ms，若仍未收到 /k 则直接发图
+            // （v1 设备 /k 回复必丢，走的就是这条兜底路径，等久了纯属浪费延迟）
             try
             {
-                await Task.Delay(200, ct);
+                await Task.Delay(100, ct);
             }
             catch (OperationCanceledException)
             {

@@ -121,6 +121,7 @@
                                Foreground="#777" Margin="0,0,10,0" Text="转动恢复：未检测"/>
                     <Button x:Name="ProbeFirmwareButton" Content="检测转动恢复" Width="110" Height="30"
                             Click="ProbeFirmwareButton_Click" Margin="0,0,10,0"
+                            Visibility="Collapsed"
                             ToolTip="探测设备固件的播放指令语义（约 10 秒，期间请勿操作播放器）。结果为设态时，真实切歌后可自动恢复转盘转动。"/>
                     <Button x:Name="ConnectButton" Content="连接设备" Width="100" Height="30" 
                             Click="ConnectButton_Click" Margin="0,0,10,0"/>
