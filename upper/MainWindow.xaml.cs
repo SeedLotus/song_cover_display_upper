@@ -80,6 +80,21 @@ namespace upper
         private DateTime _lastPlaybackTopicSentAt = DateTime.MinValue;
         private const int PlaybackTopicQuietMs = 500;
         private const int PlaybackSyncDebounceMs = 150;
+
+        // 3.8 修复：v1 固件忽略 /h 心跳（60s 无有效命令即休眠 → 持续播放约 60 秒后屏幕变暗）。
+        // 设态语义设备上周期性补发当前播放状态指令充当保活：v1 下 /1 /0 都会重置休眠计时，
+        // 且设态语义下重复发送对摇臂无副作用。25s 间隔：单包丢失最坏 50s < 60s 阈值。
+        // 代价：/1 会重初始化旋转脚本（HAL_SPI_DMAStop + 脚本重启），播放中可能每 25s 出现
+        // 一次单帧级轻微闪烁，需实机观察；翻转/未探测设备不补发，彻底修复靠烧录 v2 固件。
+        private DateTime _lastV1KeepaliveAt = DateTime.Now;
+        private static readonly TimeSpan V1KeepaliveInterval = TimeSpan.FromSeconds(25);
+
+        // 3.9 修复：PC 侧快速播放/暂停切换时，摇臂物理动作滞后（预备态 duty 渐变，最长约 2s），
+        // 下位机稳定态每 123ms 轮询摇臂位置，位置与软件状态不一致即上行 /q0 /q1 反向控制。
+        // 切换风暴期间这些回包对应的是过期状态，直接应用会把用户最新操作反转回去。
+        // 距上次下发播放 topic 2.5s 内的 /q 一律抑制；下位机在摇臂持续不一致时会周期重发 /q，
+        // 窗口过期后真实手动拨臂仍能生效（自愈），不会永久丢失反向控制。
+        private const int ReverseControlSuppressMs = 2500;
         // 两段式拉取：120ms 首次拉取（尽快出图），500ms 确认拉取（兜住 SMTC 滞后更新）
         private static readonly TimeSpan MediaFirstFetchDelay = TimeSpan.FromMilliseconds(120);
         private static readonly TimeSpan MediaConfirmFetchDelay = TimeSpan.FromMilliseconds(500);
@@ -924,6 +939,7 @@ namespace upper
             {
                 case "/q1":
                     // 下位机请求播放命令
+                    if (IsReverseControlSuppressed(e.CommandText)) break;
                     ImageTransferStatusText.Text = "收到 /q1，请求播放";
                     _lowerMachinePlaying = false; // 下位机当前认为自己在暂停态
                     if (_currentPlayStatus == "Playing")
@@ -940,6 +956,7 @@ namespace upper
 
                 case "/q0":
                     // 下位机请求暂停命令
+                    if (IsReverseControlSuppressed(e.CommandText)) break;
                     ImageTransferStatusText.Text = "收到 /q0，请求暂停";
                     _lowerMachinePlaying = true; // 下位机当前认为自己在播放态
                     if (_currentPlayStatus == "Paused")
@@ -981,6 +998,24 @@ namespace upper
                     }
                     break;
             }
+        }
+
+        // 3.9：判断下位机反向控制（/q0 /q1）是否应被抑制。
+        // PC 侧刚下发过播放 topic 时，摇臂正在追上位机指令（物理动作最长约 2s），
+        // 此窗口内下位机稳定态轮询到摇臂位置不一致而发出的 /q 对应的是过期状态，
+        // 应用它会把用户最新操作反转回去，一律丢弃。
+        // 不会永久丢失真实手动拨臂：下位机在摇臂持续不一致时每 ~123ms 重发 /q，
+        // 窗口过期后的重发会正常生效（自愈）。
+        private bool IsReverseControlSuppressed(string command)
+        {
+            double sinceTopicMs = (DateTime.Now - _lastPlaybackTopicSentAt).TotalMilliseconds;
+            if (sinceTopicMs < ReverseControlSuppressMs)
+            {
+                FileLogger.Log("Sync",
+                    $"抑制反向控制 {command}：距上次下发播放 topic 仅 {sinceTopicMs:F0}ms，判定为过期/联动回包");
+                return true;
+            }
+            return false;
         }
 
         // ==================== 图片传输状态机 ====================
@@ -1571,9 +1606,26 @@ namespace upper
             }
             else
             {
-                // 状态一致时改发 /h 心跳（仅刷新下位机休眠计时，不碰播放状态机），
-                // 防止下位机 60 秒无命令进入休眠（DEV_LOG 3.6）。需配套新版固件。
-                _serialPortService.SendHeartbeat();
+                // 状态一致时的保活（3.8）：
+                // - v2 固件：/h 有效（仅刷新休眠计时，零副作用），每秒一次即可；
+                // - v1 设态设备：/h 被忽略，每 25s 补发一次当前状态指令重置休眠计时
+                //   （设态语义下重复 /1 /0 对摇臂无副作用）；
+                // - v1 翻转/未探测设备：维持 /h（被忽略，60s 休眠无法安全避免，需烧录 v2 固件）。
+                bool v1SetStateKeepalive = !_firmwareSupportsIdempotentPlayback
+                    && _appSettings.FirmwareSemantics == "SetState";
+                if (v1SetStateKeepalive && DateTime.Now - _lastV1KeepaliveAt >= V1KeepaliveInterval)
+                {
+                    if (_serialPortService.SendPlaybackStatus(pcPlaying))
+                    {
+                        _lastV1KeepaliveAt = DateTime.Now;
+                        FileLogger.Log("Sync", $"v1 保活：补发当前状态 {(pcPlaying ? "/1" : "/0")}，重置下位机休眠计时");
+                    }
+                }
+                else
+                {
+                    // 心跳（仅刷新下位机休眠计时，不碰播放状态机），需配套新版固件（DEV_LOG 3.6）
+                    _serialPortService.SendHeartbeat();
+                }
             }
         }
 
